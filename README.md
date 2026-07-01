@@ -22,6 +22,22 @@ Market data terminal: https://youtu.be/Zx6PTew7rmc
 
 Strategy backtester: https://youtu.be/NmMOAOslkIA
 
+## Screenshots
+
+### Market Data Terminal
+
+![Historical chart and live quote panel](screenshots/UI_1.png)
+
+![Historical data table](screenshots/UI_2.png)
+
+### Strategy Backtester
+
+![Trading signals](screenshots/tradingSignals.png)
+
+![Portfolio value comparison](screenshots/portfolioValue.png)
+
+![Maximum drawdown comparison](screenshots/maxDrawdown.png)
+
 ## Setup
 
 Create and activate the conda environment:
@@ -71,6 +87,7 @@ alpaca-market-data-terminal/
 ├── app.py                  # Streamlit market data terminal
 ├── backtesting.py          # Streamlit strategy backtester
 ├── docs/
+│   ├── Week2_Report.pdf        # Homework 2 report
 │   └── strategy_indicators.md  # Strategy and indicator documentation
 ├── src/
 │   ├── __init__.py
@@ -87,7 +104,10 @@ alpaca-market-data-terminal/
 │   └── plots.py            # Builds Plotly charts for backtest results
 ├── screenshots/
 │   ├── UI_1.png            # Historical chart and live quote screenshot
-│   └── UI_2.png            # Historical data table screenshot
+│   ├── UI_2.png            # Historical data table screenshot
+│   ├── maxDrawdown.png     # Backtester drawdown chart screenshot
+│   ├── portfolioValue.png  # Backtester portfolio value screenshot
+│   └── tradingSignals.png  # Backtester buy/sell signal screenshot
 ├── .env.example            # Template for required Alpaca API credentials
 ├── .gitignore              # Excludes local secrets, caches, and system files
 ├── environment.yml         # Conda environment specification
