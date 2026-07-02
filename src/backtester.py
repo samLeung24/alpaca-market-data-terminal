@@ -59,6 +59,25 @@ STRATEGY_SPECS = {
 }
 
 
+def build_ml_strategy_spec() -> StrategySpec:
+    # src/models.py is a placeholder; import lazily so module import keeps working.
+    try:
+        from src.models import generate_ml_signals
+    except ImportError as exc:
+        raise ImportError(
+            "src/models.py does not define generate_ml_signals yet."
+        ) from exc
+
+    return StrategySpec(
+        name="ML Signal",
+        signal_function=generate_ml_signals,
+        position_col="ml_position",
+        trade_signal_col="ml_trade_signal",
+        buy_signal_col="ml_buy_signal",
+        sell_signal_col="ml_sell_signal",
+    )
+
+
 def build_trade_log(
     history: pd.DataFrame,
     trade_signal_col: str = "trade_signal",
