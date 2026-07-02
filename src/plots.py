@@ -15,6 +15,7 @@ STRATEGY_LINE_COLORS = {
     "Trend Following": "#4F7CAC",
     "Mean Reversion": "#C9823B",
     "Custom Multi-Factor": "#7A6FA8",
+    "ML Signal": "#1B7F5C",
 }
 
 
@@ -103,6 +104,56 @@ def plot_drawdowns(
         title=dict(text="Drawdown", font=dict(size=24)),
         yaxis_title="Drawdown",
         yaxis_tickformat=".0%",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    return fig
+
+
+def plot_pca_explained_variance(
+    explained_variance_ratio: Any,
+    threshold: float = 0.80,
+) -> go.Figure:
+
+    ratios = pd.Series(explained_variance_ratio, dtype=float).reset_index(drop=True)
+    components = [f"PC{i + 1}" for i in range(len(ratios))]
+    cumulative = ratios.cumsum()
+
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Bar(
+            x=components,
+            y=ratios,
+            name="Per component",
+            marker_color="rgba(27, 127, 92, 0.55)",
+        )
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=components,
+            y=cumulative,
+            mode="lines+markers",
+            name="Cumulative",
+            line=dict(color="#111111", width=2),
+        )
+    )
+
+    fig.add_hline(
+        y=threshold,
+        line_dash="dash",
+        line_color="rgba(220, 38, 38, 0.8)",
+        annotation_text=f"{threshold:.0%} threshold",
+        annotation_position="bottom right",
+    )
+
+    fig.update_layout(
+        height=360,
+        margin=dict(l=20, r=20, t=45, b=20),
+        title=dict(text="PCA Explained Variance", font=dict(size=24)),
+        yaxis_title="Explained Variance",
+        yaxis_tickformat=".0%",
+        yaxis_range=[0, 1.02],
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
     return fig
