@@ -8,6 +8,7 @@ dependencies:
   - matplotlib
   - plotly
   - python-dotenv
+  - scikit-learn
   - pip
   - pip:
       - alpaca-py
