@@ -6,3 +6,4 @@ matplotlib
 plotly
 python-dotenv
 rapidfuzz
+scikit-learn
