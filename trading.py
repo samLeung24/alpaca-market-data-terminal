@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+import html
 from dataclasses import asdict
+from typing import Any
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from alpaca.common.enums import Sort
 from plotly.subplots import make_subplots
 from alpaca.data.timeframe import TimeFrameUnit
+from alpaca.trading.enums import QueryOrderStatus
+from alpaca.trading.requests import GetOrdersRequest
 
 from src.backtester import build_buy_hold_result, build_ml_strategy_spec, run_backtest
 from src.company import get_company_name
 from src.company_search import CompanyMatch, get_company_choices
-from src.data_connector import get_historical_client
+from src.data_connector import get_historical_client, get_paper_trading_client
 from src.execution import LOG_FILE, execute_latest_signal
 from src.features import build_feature_pca_pipeline, transform_latest_features
 from src.historical import fetch_daily_ohlcv, get_historical_bars
@@ -30,6 +35,8 @@ st.set_page_config(page_title="Alpaca Market Data Terminal", layout="wide")
 
 
 LIVE_QUOTE_REFRESH_SECONDS = 1.0
+PAPER_ACCOUNT_REFRESH_SECONDS = 10.0
+PAPER_ACCOUNT_ORDER_LIMIT = 50
 EASTERN_TZ = "America/New_York"
 ML_HISTORY_YEARS = 5
 ML_PERIODS_PER_YEAR = 252
@@ -239,6 +246,705 @@ def _read_paper_trading_log(max_lines: int = 80) -> str:
     lines = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
     recent_lines = lines[-max_lines:]
     return "\n".join(recent_lines) if recent_lines else "No paper-trading log entries yet."
+
+
+def _field(obj: Any, name: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def _first_field(obj: Any, *names: str, default: Any = None) -> Any:
+    for name in names:
+        value = _field(obj, name, default=None)
+        if value is not None:
+            return value
+    return default
+
+
+def _enum_text(value: Any) -> str:
+    if value is None:
+        return ""
+    raw_value = getattr(value, "value", value)
+    return str(raw_value)
+
+
+def _to_float(value: Any) -> float | None:
+    if value is None:
+        return None
+
+    raw_value = getattr(value, "value", value)
+    if isinstance(raw_value, str):
+        raw_value = raw_value.strip().replace("$", "").replace(",", "")
+        if not raw_value or raw_value.lower() in {"none", "nan", "null"}:
+            return None
+
+    try:
+        if pd.isna(raw_value):
+            return None
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        return float(raw_value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_money(value: Any, currency: str = "USD") -> str:
+    numeric = _to_float(value)
+    if numeric is None:
+        return "n/a"
+
+    sign = "-" if numeric < 0 else ""
+    suffix = f" {currency}" if currency else ""
+    return f"{sign}${abs(numeric):,.2f}{suffix}"
+
+
+def _format_plain_number(value: Any) -> str:
+    numeric = _to_float(value)
+    if numeric is None:
+        return "n/a"
+
+    if abs(numeric - round(numeric)) < 1e-9:
+        return f"{numeric:,.0f}"
+
+    return f"{numeric:,.4f}".rstrip("0").rstrip(".")
+
+
+def _format_percent(value: Any) -> str:
+    numeric = _to_float(value)
+    if numeric is None:
+        return "n/a"
+
+    return f"{numeric:.2%}"
+
+
+def _format_datetime(value: Any) -> str:
+    if value is None:
+        return "n/a"
+
+    try:
+        timestamp = pd.Timestamp(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+    if pd.isna(timestamp):
+        return "n/a"
+
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.tz_localize("UTC")
+    else:
+        timestamp = timestamp.tz_convert("UTC")
+
+    return timestamp.tz_convert(EASTERN_TZ).strftime("%Y-%m-%d %H:%M:%S E.T.")
+
+
+def _sort_timestamp(value: Any) -> pd.Timestamp:
+    if value is None:
+        return pd.Timestamp.min.tz_localize("UTC")
+
+    try:
+        timestamp = pd.Timestamp(value)
+    except (TypeError, ValueError):
+        return pd.Timestamp.min.tz_localize("UTC")
+
+    if pd.isna(timestamp):
+        return pd.Timestamp.min.tz_localize("UTC")
+
+    if timestamp.tzinfo is None:
+        return timestamp.tz_localize("UTC")
+
+    return timestamp.tz_convert("UTC")
+
+
+def _money_class(value: Any) -> str:
+    numeric = _to_float(value)
+    if numeric is None or abs(numeric) < 1e-12:
+        return "neutral"
+    return "positive" if numeric > 0 else "negative"
+
+
+def _normalize_records(records: Any) -> list[Any]:
+    if records is None:
+        return []
+    if isinstance(records, dict):
+        return list(records.values())
+    return list(records)
+
+
+def _fetch_paper_account_snapshot() -> dict[str, Any]:
+    trading_client = get_paper_trading_client()
+    order_request = GetOrdersRequest(
+        status=QueryOrderStatus.ALL,
+        limit=PAPER_ACCOUNT_ORDER_LIMIT,
+        direction=Sort.DESC,
+        nested=True,
+    )
+
+    return {
+        "account": trading_client.get_account(),
+        "positions": _normalize_records(trading_client.get_all_positions()),
+        "orders": _normalize_records(trading_client.get_orders(order_request)),
+        "fetched_at": pd.Timestamp.now(tz="UTC"),
+    }
+
+
+def _position_symbol(position: Any) -> str:
+    return str(_field(position, "symbol", "") or "").upper()
+
+
+def _selected_position(positions: list[Any], symbol: str) -> Any | None:
+    selected_symbol = symbol.strip().upper()
+    if not selected_symbol:
+        return None
+
+    for position in positions:
+        if _position_symbol(position) == selected_symbol:
+            return position
+
+    return None
+
+
+def _sum_position_field(positions: list[Any], field_name: str) -> float:
+    total = 0.0
+    for position in positions:
+        total += _to_float(_field(position, field_name)) or 0.0
+    return total
+
+
+def _order_status(order: Any) -> str:
+    return _enum_text(_field(order, "status")).lower()
+
+
+def _order_side(order: Any) -> str:
+    return _enum_text(_field(order, "side")).lower()
+
+
+def _order_result_label(status: str) -> str:
+    normalized = status.lower()
+    if normalized == "filled":
+        return "Success"
+    if "cancel" in normalized:
+        return "Cancelled"
+    if normalized == "partially_filled":
+        return "Partial"
+    if normalized in {"rejected", "expired", "stopped", "suspended"}:
+        return normalized.replace("_", " ").title()
+    if normalized in {"new", "accepted", "pending_new", "accepted_for_bidding"}:
+        return "Open"
+    return normalized.replace("_", " ").title() if normalized else "Unknown"
+
+
+def _calculate_recent_realized_pnl(orders: list[Any]) -> float:
+    lots_by_symbol: dict[str, list[dict[str, float]]] = {}
+    realized_pnl = 0.0
+
+    sorted_orders = sorted(
+        orders,
+        key=lambda order: _sort_timestamp(
+            _first_field(order, "filled_at", "submitted_at", "created_at")
+        ),
+    )
+
+    for order in sorted_orders:
+        status = _order_status(order)
+        filled_qty = _to_float(_field(order, "filled_qty")) or 0.0
+        fill_price = _to_float(_field(order, "filled_avg_price"))
+
+        if filled_qty <= 0 or fill_price is None or status not in {"filled", "partially_filled"}:
+            continue
+
+        symbol = str(_field(order, "symbol", "") or "").upper()
+        side = _order_side(order)
+        if not symbol or side not in {"buy", "sell"}:
+            continue
+
+        lots = lots_by_symbol.setdefault(symbol, [])
+        if side == "buy":
+            lots.append({"qty": filled_qty, "price": fill_price})
+            continue
+
+        remaining = filled_qty
+        while remaining > 0 and lots:
+            lot = lots[0]
+            matched_qty = min(remaining, lot["qty"])
+            realized_pnl += matched_qty * (fill_price - lot["price"])
+            lot["qty"] -= matched_qty
+            remaining -= matched_qty
+
+            if lot["qty"] <= 1e-9:
+                lots.pop(0)
+
+    return realized_pnl
+
+
+def _orders_to_dataframe(orders: list[Any]) -> pd.DataFrame:
+    rows = []
+    for order in orders:
+        status = _order_status(order)
+        side = _order_side(order)
+        submitted_at = _first_field(order, "submitted_at", "created_at")
+        filled_at = _field(order, "filled_at")
+
+        rows.append(
+            {
+                "Submitted": _format_datetime(submitted_at),
+                "Filled": _format_datetime(filled_at),
+                "Symbol": str(_field(order, "symbol", "") or "").upper(),
+                "Side": side.upper() if side else "n/a",
+                "Result": _order_result_label(status),
+                "Status": status.replace("_", " ").title() if status else "Unknown",
+                "Type": _enum_text(_first_field(order, "type", "order_type")).replace("_", " ").title(),
+                "Qty": _format_plain_number(_field(order, "qty")),
+                "Filled Qty": _format_plain_number(_field(order, "filled_qty")),
+                "Avg Fill": _format_money(_field(order, "filled_avg_price"), currency=""),
+                "Limit": _format_money(_field(order, "limit_price"), currency=""),
+                "Stop": _format_money(_field(order, "stop_price"), currency=""),
+                "Order ID": str(_field(order, "id", "") or ""),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def _orders_to_exchange_log_dataframe(orders: list[Any]) -> pd.DataFrame:
+    rows = []
+    for order in orders:
+        order_id = str(_field(order, "id", "") or "")
+        symbol = str(_field(order, "symbol", "") or "").upper()
+        side = _order_side(order).upper() or "ORDER"
+        qty = _format_plain_number(_field(order, "qty"))
+        status = _order_status(order)
+        order_type = _enum_text(_first_field(order, "type", "order_type")).replace("_", " ")
+        submitted_at = _first_field(order, "submitted_at", "created_at")
+        filled_at = _field(order, "filled_at")
+        canceled_at = _first_field(order, "canceled_at", "cancelled_at")
+        expired_at = _field(order, "expired_at")
+        failed_at = _field(order, "failed_at")
+        fill_price = _field(order, "filled_avg_price")
+
+        if submitted_at is not None:
+            rows.append(
+                {
+                    "Time": _format_datetime(submitted_at),
+                    "Message": (
+                        f"Submitted {side} {order_type} order for {qty} shares of "
+                        f"{symbol}; order id {order_id}; status {status or 'unknown'}."
+                    ),
+                    "_sort": _sort_timestamp(submitted_at),
+                }
+            )
+
+        if filled_at is not None:
+            rows.append(
+                {
+                    "Time": _format_datetime(filled_at),
+                    "Message": (
+                        f"Filled order {order_id} for {symbol}; filled quantity "
+                        f"{_format_plain_number(_field(order, 'filled_qty'))} at "
+                        f"{_format_money(fill_price, currency='')}."
+                    ),
+                    "_sort": _sort_timestamp(filled_at),
+                }
+            )
+
+        if canceled_at is not None:
+            rows.append(
+                {
+                    "Time": _format_datetime(canceled_at),
+                    "Message": f"Cancelled order {order_id} for {symbol}.",
+                    "_sort": _sort_timestamp(canceled_at),
+                }
+            )
+
+        if expired_at is not None:
+            rows.append(
+                {
+                    "Time": _format_datetime(expired_at),
+                    "Message": f"Expired order {order_id} for {symbol}.",
+                    "_sort": _sort_timestamp(expired_at),
+                }
+            )
+
+        if failed_at is not None:
+            rows.append(
+                {
+                    "Time": _format_datetime(failed_at),
+                    "Message": f"Failed order {order_id} for {symbol}; status {status or 'unknown'}.",
+                    "_sort": _sort_timestamp(failed_at),
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame(columns=["Time", "Message"])
+
+    result = pd.DataFrame(rows).sort_values("_sort", ascending=False)
+    return result.drop(columns=["_sort"]).reset_index(drop=True)
+
+
+def _positions_to_dataframe(positions: list[Any], portfolio_value: float | None) -> pd.DataFrame:
+    rows = []
+    for position in positions:
+        market_value = _to_float(_field(position, "market_value"))
+        cost_basis = _to_float(_field(position, "cost_basis"))
+        unrealized = _to_float(_field(position, "unrealized_pl"))
+        allocation = (
+            market_value / portfolio_value
+            if market_value is not None and portfolio_value not in {None, 0}
+            else None
+        )
+
+        rows.append(
+            {
+                "Symbol": _position_symbol(position),
+                "Side": (_enum_text(_field(position, "side")) or "long").title(),
+                "Allocation": _format_percent(allocation),
+                "Qty": _format_plain_number(_field(position, "qty")),
+                "Avg Price": _format_money(_field(position, "avg_entry_price"), currency=""),
+                "Current Price": _format_money(_field(position, "current_price"), currency=""),
+                "Market Value": _format_money(market_value),
+                "Cost Basis": _format_money(cost_basis),
+                "Unrealized P&L": _format_money(unrealized),
+                "Unrealized %": _format_percent(_field(position, "unrealized_plpc")),
+                "Daily P&L": _format_money(_field(position, "unrealized_intraday_pl")),
+                "_sort": abs(market_value or 0.0),
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "Symbol",
+                "Side",
+                "Allocation",
+                "Qty",
+                "Avg Price",
+                "Current Price",
+                "Market Value",
+                "Cost Basis",
+                "Unrealized P&L",
+                "Unrealized %",
+                "Daily P&L",
+            ]
+        )
+
+    result = pd.DataFrame(rows).sort_values("_sort", ascending=False)
+    return result.drop(columns=["_sort"]).reset_index(drop=True)
+
+
+def _account_details_dataframe(account: Any, positions: list[Any], orders: list[Any]) -> pd.DataFrame:
+    details = [
+        ("Account status", _enum_text(_field(account, "status")) or "n/a"),
+        ("Currency", _enum_text(_field(account, "currency")) or "USD"),
+        ("Cash", _format_money(_field(account, "cash"))),
+        ("Buying power", _format_money(_field(account, "buying_power"))),
+        ("Portfolio value", _format_money(_first_field(account, "portfolio_value", "equity"))),
+        ("Equity", _format_money(_field(account, "equity"))),
+        ("Last equity", _format_money(_field(account, "last_equity"))),
+        ("Long market value", _format_money(_field(account, "long_market_value"))),
+        ("Maintenance margin", _format_money(_field(account, "maintenance_margin"))),
+        ("Open positions", str(len(positions))),
+        ("Recent orders loaded", str(len(orders))),
+    ]
+    return pd.DataFrame(details, columns=["Field", "Value"])
+
+
+def _selected_position_dataframe(position: Any | None, symbol: str, is_valid_symbol: bool) -> pd.DataFrame:
+    if not is_valid_symbol:
+        return pd.DataFrame(
+            [{"Field": "Selected equity", "Value": symbol or "No valid symbol selected"}]
+        )
+
+    if position is None:
+        return pd.DataFrame(
+            [
+                {"Field": "Selected equity", "Value": symbol},
+                {"Field": "Position", "Value": "Flat"},
+                {"Field": "Qty", "Value": "0"},
+                {"Field": "Market value", "Value": _format_money(0)},
+            ]
+        )
+
+    details = [
+        ("Selected equity", _position_symbol(position)),
+        ("Position", (_enum_text(_field(position, "side")) or "long").title()),
+        ("Qty", _format_plain_number(_field(position, "qty"))),
+        ("Available qty", _format_plain_number(_field(position, "qty_available"))),
+        ("Average entry", _format_money(_field(position, "avg_entry_price"), currency="")),
+        ("Current price", _format_money(_field(position, "current_price"), currency="")),
+        ("Market value", _format_money(_field(position, "market_value"))),
+        ("Cost basis", _format_money(_field(position, "cost_basis"))),
+        ("Unrealized P&L", _format_money(_field(position, "unrealized_pl"))),
+        ("Unrealized %", _format_percent(_field(position, "unrealized_plpc"))),
+        ("Daily P&L", _format_money(_field(position, "unrealized_intraday_pl"))),
+    ]
+    return pd.DataFrame(details, columns=["Field", "Value"])
+
+
+def _paper_account_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        .paper-account-heading {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.75rem;
+            margin: 0.25rem 0 0.6rem;
+        }
+        .paper-account-title {
+            font-size: 1.25rem;
+            font-weight: 700;
+            color: #111827;
+        }
+        .paper-account-subtitle {
+            color: #6b7280;
+            font-size: 0.82rem;
+            margin-top: 0.15rem;
+        }
+        .paper-account-shell {
+            background: #ffffff;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 0.55rem;
+            margin: 0.25rem 0 0.65rem;
+        }
+        .paper-card-grid {
+            display: grid;
+            grid-template-columns: repeat(5, minmax(130px, 1fr));
+            gap: 0.5rem;
+        }
+        .paper-card {
+            background: #f9fafb;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 0.55rem 0.65rem;
+            min-height: 62px;
+        }
+        .paper-card-label {
+            color: #6b7280;
+            font-size: 0.72rem;
+            font-weight: 650;
+            line-height: 1.2;
+            margin-bottom: 0.22rem;
+        }
+        .paper-card-value {
+            color: #111827;
+            font-size: 1rem;
+            font-weight: 750;
+            line-height: 1.18;
+            overflow-wrap: anywhere;
+        }
+        .paper-card-value.positive {
+            color: #059669;
+        }
+        .paper-card-value.negative {
+            color: #dc2626;
+        }
+        .paper-card-note {
+            color: #6b7280;
+            font-size: 0.68rem;
+            margin-top: 0.25rem;
+            line-height: 1.25;
+            overflow-wrap: anywhere;
+        }
+        @media (max-width: 1200px) {
+            .paper-card-grid {
+                grid-template-columns: repeat(3, minmax(150px, 1fr));
+            }
+        }
+        @media (max-width: 720px) {
+            .paper-card-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_metric_cards(cards: list[dict[str, str]]) -> None:
+    card_html = []
+    for card in cards:
+        value_class = html.escape(card.get("class", "neutral"))
+        card_html.append(
+            '<div class="paper-card">'
+            f'<div class="paper-card-label">{html.escape(card["label"])}</div>'
+            f'<div class="paper-card-value {value_class}">{html.escape(card["value"])}</div>'
+            f'<div class="paper-card-note">{html.escape(card["note"])}</div>'
+            "</div>"
+        )
+
+    st.markdown(
+        '<div class="paper-account-shell">'
+        '<div class="paper-card-grid">'
+        f'{"".join(card_html)}'
+        "</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _build_account_cards(
+    account: Any,
+    positions: list[Any],
+    orders: list[Any],
+    symbol: str,
+    is_valid_symbol: bool,
+) -> list[dict[str, str]]:
+    portfolio_value = _to_float(_first_field(account, "portfolio_value", "equity"))
+    buying_power = _to_float(_field(account, "buying_power"))
+    cash = _to_float(_field(account, "cash"))
+    unrealized_pnl = _sum_position_field(positions, "unrealized_pl")
+    total_cost = _sum_position_field(positions, "cost_basis")
+    unrealized_pct = unrealized_pnl / total_cost if total_cost else None
+    realized_pnl = _calculate_recent_realized_pnl(orders)
+    recent_order = orders[0] if orders else None
+
+    if recent_order is None:
+        recent_value = "No orders"
+        recent_note = "No recent paper order history returned"
+        recent_class = "neutral"
+    else:
+        status = _order_status(recent_order)
+        recent_value = _order_result_label(status)
+        recent_note = (
+            f"{_order_side(recent_order).upper()} "
+            f"{_format_plain_number(_field(recent_order, 'qty'))} "
+            f"{str(_field(recent_order, 'symbol', '') or '').upper()}"
+        )
+        if status == "filled":
+            recent_class = "positive"
+        elif status in {"rejected", "expired"} or "cancel" in status:
+            recent_class = "negative"
+        else:
+            recent_class = "neutral"
+
+    return [
+        {
+            "label": "Portfolio Value",
+            "value": _format_money(portfolio_value),
+            "note": f"Cash {_format_money(cash)}",
+            "class": "neutral",
+        },
+        {
+            "label": "Buying Power",
+            "value": _format_money(buying_power),
+            "note": "Available paper funds",
+            "class": "neutral",
+        },
+        {
+            "label": "Unrealized P&L",
+            "value": _format_money(unrealized_pnl),
+            "note": f"{_format_percent(unrealized_pct)} on open cost basis",
+            "class": _money_class(unrealized_pnl),
+        },
+        {
+            "label": "Realized P&L (recent)",
+            "value": _format_money(realized_pnl),
+            "note": "FIFO estimate from loaded fills",
+            "class": _money_class(realized_pnl),
+        },
+        {
+            "label": "Recent Order",
+            "value": recent_value,
+            "note": recent_note,
+            "class": recent_class,
+        },
+    ]
+
+
+@st.fragment(run_every=PAPER_ACCOUNT_REFRESH_SECONDS)
+def render_paper_account_panel(symbol: str, is_valid_symbol: bool) -> None:
+    _paper_account_styles()
+
+    title_col, action_col = st.columns([0.82, 0.18], vertical_alignment="center")
+    with title_col:
+        st.markdown(
+            """
+            <div class="paper-account-heading">
+                <div>
+                    <div class="paper-account-title">Paper Account</div>
+                    <div class="paper-account-subtitle">
+                        Live Alpaca paper portfolio, holdings, orders, and execution journal.
+                    </div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with action_col:
+        st.button("Refresh Account", key="paper_account_refresh", width="stretch")
+
+    try:
+        snapshot = _fetch_paper_account_snapshot()
+    except Exception as exc:
+        st.warning(f"Could not load Alpaca paper account: {exc}")
+        return
+
+    account = snapshot["account"]
+    positions = snapshot["positions"]
+    orders = snapshot["orders"]
+    portfolio_value = _to_float(_first_field(account, "portfolio_value", "equity"))
+
+    _render_metric_cards(
+        _build_account_cards(
+            account=account,
+            positions=positions,
+            orders=orders,
+            symbol=symbol,
+            is_valid_symbol=is_valid_symbol,
+        )
+    )
+
+    st.caption(
+        "Account data refreshes every "
+        f"{PAPER_ACCOUNT_REFRESH_SECONDS:.0f}s. Last refresh: "
+        f"{_format_datetime(snapshot['fetched_at'])}."
+    )
+
+    tab_overview, tab_holdings, tab_transactions = st.tabs(
+        ["Overview", "Holdings", "Transactions"]
+    )
+
+    with tab_overview:
+        st.markdown("**Account Details**")
+        st.dataframe(
+            _account_details_dataframe(account, positions, orders),
+            hide_index=True,
+            width="stretch",
+        )
+
+    with tab_holdings:
+        holdings_df = _positions_to_dataframe(positions, portfolio_value)
+        if holdings_df.empty:
+            st.info("No open paper positions.")
+        else:
+            st.dataframe(holdings_df, hide_index=True, width="stretch")
+
+    with tab_transactions:
+        order_history_df = _orders_to_dataframe(orders)
+        exchange_log_df = _orders_to_exchange_log_dataframe(orders)
+
+        st.markdown("**Order History**")
+        if order_history_df.empty:
+            st.info("No recent paper orders returned by Alpaca.")
+        else:
+            st.dataframe(order_history_df, hide_index=True, width="stretch")
+
+        st.markdown("**Alpaca Order Event Log**")
+        if exchange_log_df.empty:
+            st.info("No exchange order events returned by Alpaca.")
+        else:
+            st.dataframe(exchange_log_df, hide_index=True, width="stretch")
+
+        st.markdown("**Local Execution Log**")
+        st.code(
+            _read_paper_trading_log(max_lines=160),
+            language="text",
+        )
 
 
 def _build_ml_results(
@@ -539,7 +1245,7 @@ def render_ml_trading_panel(symbol: str, is_valid_symbol: bool) -> None:
         st.markdown("Recent paper-trading log")
         st.code(_read_paper_trading_log(), language="text")
 
-st.title("Mini Market Data Terminal v1.0")
+st.title("Mini Market Terminal")
 
 
 if "ticker_input" not in st.session_state:
@@ -664,6 +1370,8 @@ except ValueError as exc:
     st.stop()
 
 
+render_paper_account_panel(symbol, is_valid_symbol)
+
 left, right = st.columns([2, 1])
 
 
@@ -774,7 +1482,8 @@ with left:
 
             # Fixed deprecation warning:
             # use_container_width=True -> width="stretch"
-            table_area.dataframe(display_df.tail(50), width="stretch")
+            with table_area.expander("OHLCV Data", expanded=False):
+                st.dataframe(display_df.tail(50), width="stretch")
 
 
 with right:
