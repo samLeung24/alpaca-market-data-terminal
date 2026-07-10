@@ -1,0 +1,19 @@
+{
+  "_note": "Copy this file to strategy_config.json for local settings. Do not commit strategy_config.json. Keep strategies empty unless you intentionally want strategies restored on app start.",
+  "strategies": [],
+  "example_strategies": [
+    {
+      "strategy": "Trend-following",
+      "equity": "AAPL",
+      "started_at": "2026-01-01T14:30:00+00:00",
+      "capital_allocation_pct": 0.1
+    },
+    {
+      "strategy": "ML Logistic Regression",
+      "equity": "MSFT",
+      "started_at": "2026-01-01T14:30:00+00:00",
+      "capital_allocation_pct": 0.1,
+      "probability_threshold": 0.6
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "_note": "Copy this file to risk_config.json for local settings. Do not commit risk_config.json.",
+  "enabled": true,
+  "stop_loss_pct": 0.2,
+  "max_allocation_pct": 0.25
+}
