@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from datetime import UTC, datetime, timedelta
 
 import pandas as pd
@@ -19,6 +20,19 @@ RANGE_PRESETS = {
     "6M": pd.DateOffset(months=6),
     "1Y": pd.DateOffset(years=1),
     "5Y": pd.DateOffset(years=5),
+}
+
+INDICATOR_WARMUP_BARS = {
+    "SMA 50": 50,
+    "SMA 200": 200,
+    "EMA 12": 36,
+    "EMA 20": 60,
+    "EMA 26": 78,
+    "MACD": 78,
+    "RSI 14": 14,
+    "Bollinger Bands": 20,
+    "Momentum 10": 10,
+    "Stochastic Oscillator": 14,
 }
 
 
@@ -80,6 +94,59 @@ def resolve_tick_spec(
         return 1, TimeFrameUnit.Hour, 1
 
     return 1, TimeFrameUnit.Minute, 1
+
+
+def get_indicator_warmup_bars(selected_indicators: list[str]) -> int:
+    """Return the largest hidden-bar lookback needed by selected indicators."""
+    return max(
+        (INDICATOR_WARMUP_BARS.get(indicator, 0) for indicator in selected_indicators),
+        default=0,
+    )
+
+
+def resolve_indicator_fetch_start(
+    display_start: pd.Timestamp,
+    timeframe_value: int,
+    timeframe_unit: TimeFrameUnit,
+    aggregate_factor: int,
+    selected_indicators: list[str],
+) -> pd.Timestamp:
+    """Expand a chart fetch start so indicators have hidden warm-up bars."""
+    warmup_bars = get_indicator_warmup_bars(selected_indicators)
+    if warmup_bars <= 0:
+        return display_start
+
+    resolved_start = pd.Timestamp(display_start)
+    if resolved_start.tzinfo is None:
+        resolved_start = resolved_start.tz_localize("UTC")
+    else:
+        resolved_start = resolved_start.tz_convert("UTC")
+
+    if timeframe_unit == TimeFrameUnit.Minute:
+        minutes_per_bar = max(1, int(timeframe_value))
+        bars_per_session = max(1, math.floor(390 / minutes_per_bar))
+        sessions = math.ceil(warmup_bars / bars_per_session)
+        calendar_days = math.ceil(sessions * 7 / 5) + 3
+        return resolved_start - pd.DateOffset(days=calendar_days)
+
+    if timeframe_unit == TimeFrameUnit.Hour:
+        hours_per_bar = max(1, int(timeframe_value))
+        bars_per_session = max(1, math.floor(6.5 / hours_per_bar))
+        sessions = math.ceil(warmup_bars / bars_per_session)
+        calendar_days = math.ceil(sessions * 7 / 5) + 3
+        return resolved_start - pd.DateOffset(days=calendar_days)
+
+    if timeframe_unit == TimeFrameUnit.Day:
+        days_per_bar = max(1, int(aggregate_factor))
+        trading_days = warmup_bars * days_per_bar
+        calendar_days = math.ceil(trading_days * 7 / 5) + 10
+        return resolved_start - pd.DateOffset(days=calendar_days)
+
+    if timeframe_unit == TimeFrameUnit.Month:
+        months_per_bar = max(1, int(timeframe_value))
+        return resolved_start - pd.DateOffset(months=warmup_bars * months_per_bar)
+
+    return resolved_start
 
 
 def aggregate_bars_by_days(df: pd.DataFrame, days: int) -> pd.DataFrame:

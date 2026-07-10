@@ -33,11 +33,16 @@ if TYPE_CHECKING:
 RISK_CONFIG_FILE = Path("risk_config.json")
 
 DEFAULT_STOP_LOSS_PCT = 0.20
-DEFAULT_MAX_ALLOCATION_PCT = 0.15
-MIN_STOP_LOSS_PCT = 0.005
-MAX_STOP_LOSS_PCT = 0.95
-MIN_ALLOCATION_PCT = 0.01
-MAX_ALLOCATION_LIMIT_PCT = 1.0
+DEFAULT_MAX_ALLOCATION_PCT = 0.25
+MIN_STOP_LOSS_PCT = 0.10
+MAX_STOP_LOSS_PCT = 0.50
+MIN_ALLOCATION_PCT = 0.10
+MAX_ALLOCATION_LIMIT_PCT = 0.50
+STOP_LOSS_WATCH_RATIO = 0.50
+ALLOCATION_WATCH_RATIO = 0.80
+RISK_FLAG_CLEAR = "Active"
+RISK_FLAG_WATCH = "Watch"
+RISK_FLAG_BREACH = "Breach"
 
 RISK_REFRESH_SECONDS = 10.0
 CLOSE_COOLDOWN_SECONDS = 90.0
@@ -69,6 +74,8 @@ class PositionRiskStatus:
     unrealized_plpc: float | None
     stop_loss_breached: bool
     allocation_breached: bool
+    stop_loss_watch: bool
+    allocation_watch: bool
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -156,18 +163,33 @@ def evaluate_position_risk(
     )
     unrealized_plpc = position_unrealized_plpc(position)
 
+    stop_loss_breached = (
+        unrealized_plpc is not None and unrealized_plpc <= -config.stop_loss_pct
+    )
+    allocation_breached = (
+        allocation is not None and allocation > config.max_allocation_pct + 1e-9
+    )
+    stop_loss_watch = (
+        unrealized_plpc is not None
+        and unrealized_plpc <= -(config.stop_loss_pct * STOP_LOSS_WATCH_RATIO)
+        and not stop_loss_breached
+    )
+    allocation_watch = (
+        allocation is not None
+        and allocation >= config.max_allocation_pct * ALLOCATION_WATCH_RATIO
+        and not allocation_breached
+    )
+
     return PositionRiskStatus(
         symbol=symbol,
         qty=qty,
         market_value=market_value,
         allocation=allocation,
         unrealized_plpc=unrealized_plpc,
-        stop_loss_breached=(
-            unrealized_plpc is not None and unrealized_plpc <= -config.stop_loss_pct
-        ),
-        allocation_breached=(
-            allocation is not None and allocation > config.max_allocation_pct + 1e-9
-        ),
+        stop_loss_breached=stop_loss_breached,
+        allocation_breached=allocation_breached,
+        stop_loss_watch=stop_loss_watch,
+        allocation_watch=allocation_watch,
     )
 
 
@@ -315,13 +337,51 @@ def get_active_risk_config() -> RiskConfig:
     return config
 
 
-def _position_status_label(status: PositionRiskStatus) -> str:
-    labels = []
-    if status.stop_loss_breached:
-        labels.append("Stop loss breached")
+def position_risk_flag(status: PositionRiskStatus) -> str:
+    if status.stop_loss_breached or status.allocation_breached:
+        return RISK_FLAG_BREACH
+    if status.stop_loss_watch or status.allocation_watch:
+        return RISK_FLAG_WATCH
+    return RISK_FLAG_CLEAR
+
+
+def position_risk_tooltip(status: PositionRiskStatus, config: RiskConfig) -> str:
+    """Explain why a position is in Watch or Breach state."""
+    flag = position_risk_flag(status)
+    if flag == RISK_FLAG_CLEAR:
+        return ""
+
+    messages = []
+    allocation_text = format_percent(status.allocation)
+    max_allocation_text = _percent_label(config.max_allocation_pct)
+    stop_loss_text = _percent_label(config.stop_loss_pct)
+
     if status.allocation_breached:
-        labels.append("Over allocation")
-    return " + ".join(labels) if labels else "OK"
+        messages.append(
+            f"Current allocation {allocation_text} is greater than the set "
+            f"{max_allocation_text} limit."
+        )
+    elif status.allocation_watch:
+        watch_limit = _percent_label(config.max_allocation_pct * ALLOCATION_WATCH_RATIO)
+        messages.append(
+            f"Allocation {allocation_text} is in Watch because it is at or above "
+            f"{watch_limit}, which is 80% of the set {max_allocation_text} limit."
+        )
+
+    if status.stop_loss_breached:
+        messages.append(
+            f"Drawdown {format_percent(status.unrealized_plpc)} is at or below "
+            f"the set -{stop_loss_text} stop-loss limit."
+        )
+    elif status.stop_loss_watch:
+        watch_loss = _percent_label(config.stop_loss_pct * STOP_LOSS_WATCH_RATIO)
+        messages.append(
+            f"Drawdown {format_percent(status.unrealized_plpc)} is in Watch because "
+            f"it is at or below -{watch_loss}, half of the set -{stop_loss_text} "
+            "stop-loss limit."
+        )
+
+    return " ".join(messages)
 
 
 def _risk_statuses_dataframe(statuses: list[PositionRiskStatus]) -> pd.DataFrame:
@@ -332,7 +392,7 @@ def _risk_statuses_dataframe(statuses: list[PositionRiskStatus]) -> pd.DataFrame
             "Market Value": format_money(status.market_value),
             "Allocation": format_percent(status.allocation),
             "Unrealized %": format_percent(status.unrealized_plpc),
-            "Status": _position_status_label(status),
+            "Status": position_risk_flag(status),
         }
         for status in statuses
     ]
@@ -364,21 +424,23 @@ def _render_risk_config_form(config: RiskConfig) -> None:
                     "limit. When off, breaches are only highlighted."
                 ),
             )
-            stop_loss_percent = st.number_input(
+            stop_loss_percent = st.slider(
                 "Stop loss (% loss per position)",
                 min_value=MIN_STOP_LOSS_PCT * 100,
                 max_value=MAX_STOP_LOSS_PCT * 100,
                 value=config.stop_loss_pct * 100,
-                step=0.5,
+                step=1.0,
+                format="%.0f%%",
                 key="risk_stop_loss_input",
                 help="Close a position when its unrealized loss reaches this percentage.",
             )
-            allocation_percent = st.number_input(
+            allocation_percent = st.slider(
                 "Max allocation per position (% of portfolio)",
                 min_value=MIN_ALLOCATION_PCT * 100,
                 max_value=MAX_ALLOCATION_LIMIT_PCT * 100,
                 value=config.max_allocation_pct * 100,
                 step=1.0,
+                format="%.0f%%",
                 key="risk_allocation_input",
                 help=(
                     "New buys are sized so a single position never exceeds this "
@@ -404,7 +466,7 @@ def _render_risk_config_form(config: RiskConfig) -> None:
 
 
 @st.fragment(run_every=RISK_REFRESH_SECONDS)
-def _render_risk_status_panel() -> None:
+def _render_risk_status_panel(show_position_table: bool = True) -> None:
     config = get_active_risk_config()
 
     try:
@@ -456,14 +518,15 @@ def _render_risk_status_panel() -> None:
             "Risk rules are breached but enforcement is off; no orders were submitted."
         )
 
-    if not statuses:
-        st.info("No open paper positions to monitor.")
-    else:
-        st.dataframe(
-            _risk_statuses_dataframe(statuses),
-            hide_index=True,
-            width="stretch",
-        )
+    if show_position_table:
+        if not statuses:
+            st.info("No open paper positions to monitor.")
+        else:
+            st.dataframe(
+                _risk_statuses_dataframe(statuses),
+                hide_index=True,
+                width="stretch",
+            )
 
     history = st.session_state.get(RISK_EVENTS_STATE_KEY) or []
     if history:
@@ -475,8 +538,13 @@ def _render_risk_status_panel() -> None:
         )
 
 
-def render_risk_management_panel() -> None:
-    st.subheader("Risk Management")
+def render_risk_management_panel(
+    show_heading: bool = True,
+    show_position_table: bool = True,
+) -> None:
+    if show_heading:
+        st.subheader("Risk Management")
+
     config = get_active_risk_config()
     _render_risk_config_form(config)
-    _render_risk_status_panel()
+    _render_risk_status_panel(show_position_table=show_position_table)

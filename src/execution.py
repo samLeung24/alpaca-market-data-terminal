@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import math
 from dataclasses import dataclass, field
@@ -19,7 +20,15 @@ from alpaca.trading.requests import (
 
 from src.config import AlpacaSettings
 from src.data_connector import get_paper_trading_client
-from src.risk import RiskConfig, apply_risk_to_order_plan, load_risk_config
+from src.risk import (
+    RISK_FLAG_CLEAR,
+    RiskConfig,
+    apply_risk_to_order_plan,
+    evaluate_position_risk,
+    load_risk_config,
+    position_risk_flag,
+    position_risk_tooltip,
+)
 from src.formatting import (
     EASTERN_TZ,
     enum_text,
@@ -39,9 +48,20 @@ from src.formatting import (
 DEFAULT_ORDER_NOTIONAL = 10_000.0
 PAPER_ACCOUNT_ORDER_LIMIT = 50
 ML_STRATEGY_DISPLAY_NAME = "ML Logistic Regression"
+ML_PROBABILITY_THRESHOLD_DEFAULT = 0.60
+ML_PROBABILITY_THRESHOLD_MIN = 0.10
+ML_PROBABILITY_THRESHOLD_MAX = 0.90
+STRATEGY_CAPITAL_ALLOCATION_DEFAULT = 0.10
+STRATEGY_CAPITAL_ALLOCATION_MIN = 0.0
+STRATEGY_CAPITAL_ALLOCATION_MAX = 0.20
+ML_EXECUTION_LOOKBACK_YEARS = 5
+ML_EXECUTION_TEST_SIZE = 0.20
+ML_EXECUTION_VARIANCE_THRESHOLD = 0.80
+RULE_BASED_EXECUTION_LOOKBACK_YEARS = 5
 
 LOG_DIR = Path("logs")
 LOG_FILE = LOG_DIR / "paper_trading.log"
+STRATEGY_CONFIG_FILE = Path("strategy_config.json")
 
 
 @dataclass(frozen=True)
@@ -213,7 +233,11 @@ def position_symbol(position: Any) -> str:
     return str(object_field(position, "symbol", "") or "").upper()
 
 
-def current_strategy_state_from_positions(positions: list[Any]) -> dict[str, Any]:
+def current_strategy_state_from_positions(
+    positions: list[Any],
+    portfolio_value: float | None = None,
+    risk_config: RiskConfig | None = None,
+) -> dict[str, Any]:
     open_positions = []
     for position in positions:
         qty = to_float(object_field(position, "qty")) or 0.0
@@ -225,77 +249,406 @@ def current_strategy_state_from_positions(positions: list[Any]) -> dict[str, Any
 
     if not open_positions:
         return {
-            "equity": "Flat",
-            "status": "Flat",
+            "equity": "None",
+            "status": "Inactive",
             "has_position": False,
+            "positions": [],
         }
 
     open_positions.sort(key=lambda item: item[0], reverse=True)
-    active_symbols = [
-        position_symbol(position)
-        for _, position in open_positions
-        if position_symbol(position)
-    ]
+    active_position = open_positions[0][1]
+    active_risk_config = risk_config or load_risk_config()
+    position_rows = []
+    for _, position in open_positions:
+        symbol = position_symbol(position)
+        if not symbol:
+            continue
+
+        risk_status = evaluate_position_risk(
+            position,
+            portfolio_value,
+            active_risk_config,
+        )
+        position_rows.append(
+            {
+                "equity": symbol,
+                "status": (
+                    position_risk_flag(risk_status)
+                    if risk_status is not None
+                    else RISK_FLAG_CLEAR
+                ),
+                "status_tooltip": (
+                    position_risk_tooltip(risk_status, active_risk_config)
+                    if risk_status is not None
+                    else ""
+                ),
+            }
+        )
+
+    active_symbols = [row["equity"] for row in position_rows]
     active_symbol = active_symbols[0] if active_symbols else "n/a"
+    active_risk_status = evaluate_position_risk(
+        active_position,
+        portfolio_value,
+        active_risk_config,
+    )
 
     return {
         "equity": active_symbol,
-        "status": "Active",
+        "status": (
+            position_risk_flag(active_risk_status)
+            if active_risk_status is not None
+            else RISK_FLAG_CLEAR
+        ),
         "has_position": True,
+        "positions": position_rows,
     }
 
 
 def fetch_current_strategy_state() -> dict[str, Any]:
     client = get_paper_trading_client()
+    account = client.get_account()
     positions = normalize_records(client.get_all_positions())
-    return current_strategy_state_from_positions(positions)
+    return current_strategy_state_from_positions(
+        positions,
+        portfolio_value=account_portfolio_value(account),
+        risk_config=load_risk_config(),
+    )
+
+
+def _strategy_timestamp(value: Any) -> pd.Timestamp:
+    if isinstance(value, pd.Timestamp):
+        timestamp = value
+    elif value:
+        try:
+            timestamp = pd.Timestamp(value)
+        except (TypeError, ValueError):
+            timestamp = pd.Timestamp.now(tz="UTC")
+    else:
+        timestamp = pd.Timestamp.now(tz="UTC")
+
+    if timestamp.tzinfo is None:
+        return timestamp.tz_localize("UTC")
+    return timestamp.tz_convert("UTC")
+
+
+def _strategy_probability_threshold(value: Any) -> float:
+    threshold = to_float(value)
+    if threshold is None:
+        return ML_PROBABILITY_THRESHOLD_DEFAULT
+
+    return min(
+        max(threshold, ML_PROBABILITY_THRESHOLD_MIN),
+        ML_PROBABILITY_THRESHOLD_MAX,
+    )
+
+
+def _strategy_capital_allocation(value: Any) -> float:
+    allocation = to_float(value)
+    if allocation is None:
+        return STRATEGY_CAPITAL_ALLOCATION_DEFAULT
+
+    return min(
+        max(allocation, STRATEGY_CAPITAL_ALLOCATION_MIN),
+        STRATEGY_CAPITAL_ALLOCATION_MAX,
+    )
+
+
+def normalize_strategy_configs(configs: Any) -> list[dict[str, Any]]:
+    if configs is None:
+        return []
+
+    if isinstance(configs, dict):
+        records = configs.get("strategies")
+        if records is None:
+            records = [configs]
+    elif isinstance(configs, list):
+        records = configs
+    else:
+        return []
+
+    normalized = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+
+        strategy = str(record.get("strategy", "") or "").strip()
+        equity = str(record.get("equity", "") or "").strip().upper()
+        if (
+            not strategy
+            or not equity
+            or strategy.lower() == "none"
+            or equity.lower() in {"none", "flat", "n/a"}
+        ):
+            continue
+
+        config = {
+            "strategy": strategy,
+            "equity": equity,
+            "started_at": _strategy_timestamp(record.get("started_at")),
+            "capital_allocation_pct": _strategy_capital_allocation(
+                record.get("capital_allocation_pct")
+            ),
+        }
+        if strategy == ML_STRATEGY_DISPLAY_NAME:
+            config["probability_threshold"] = _strategy_probability_threshold(
+                record.get("probability_threshold")
+            )
+
+        normalized.append(config)
+
+    return normalized
+
+
+def merge_strategy_configs(configs: Any) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    index_by_key: dict[tuple[str, str], int] = {}
+
+    for config in normalize_strategy_configs(configs):
+        key = (config["strategy"], config["equity"])
+        if key in index_by_key:
+            merged[index_by_key[key]] = config
+            continue
+
+        index_by_key[key] = len(merged)
+        merged.append(config)
+
+    return merged
+
+
+def load_strategy_configs(path: Path = STRATEGY_CONFIG_FILE) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+
+    return merge_strategy_configs(data)
+
+
+def _strategy_config_to_json(config: dict[str, Any]) -> dict[str, Any]:
+    started_at = _strategy_timestamp(config.get("started_at"))
+    payload = {
+        "strategy": str(config.get("strategy", "")),
+        "equity": str(config.get("equity", "")).upper(),
+        "started_at": started_at.isoformat(),
+        "capital_allocation_pct": _strategy_capital_allocation(
+            config.get("capital_allocation_pct")
+        ),
+    }
+    if payload["strategy"] == ML_STRATEGY_DISPLAY_NAME:
+        payload["probability_threshold"] = _strategy_probability_threshold(
+            config.get("probability_threshold")
+        )
+
+    return payload
+
+
+def save_strategy_configs(
+    configs: Any,
+    path: Path = STRATEGY_CONFIG_FILE,
+) -> list[dict[str, Any]]:
+    normalized = merge_strategy_configs(configs)
+    payload = {
+        "strategies": [_strategy_config_to_json(config) for config in normalized]
+    }
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return normalized
+
+
+def add_strategy_config(
+    strategy: str,
+    equity: str,
+    probability_threshold: float | None = None,
+    capital_allocation_pct: float | None = None,
+    path: Path = STRATEGY_CONFIG_FILE,
+) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+    active_config, start_report = build_strategy_start_state(
+        strategy,
+        equity,
+        probability_threshold=probability_threshold,
+        capital_allocation_pct=capital_allocation_pct,
+    )
+    active_configs = save_strategy_configs(load_strategy_configs(path) + [active_config], path)
+    return active_config, start_report, active_configs
+
+
+def _strategy_identity(strategy: str, equity: str) -> tuple[str, str]:
+    return str(strategy or "").strip(), str(equity or "").strip().upper()
+
+
+def strategy_config_matches(
+    config: dict[str, Any],
+    strategy: str,
+    equity: str,
+) -> bool:
+    target_strategy, target_equity = _strategy_identity(strategy, equity)
+    return (
+        str(config.get("strategy", "")).strip() == target_strategy
+        and str(config.get("equity", "")).strip().upper() == target_equity
+    )
+
+
+def remove_strategy_config(
+    strategy: str,
+    equity: str,
+    path: Path = STRATEGY_CONFIG_FILE,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    configs = load_strategy_configs(path)
+    removed_config = next(
+        (
+            config
+            for config in configs
+            if strategy_config_matches(config, strategy, equity)
+        ),
+        None,
+    )
+    remaining_configs = [
+        config
+        for config in configs
+        if not strategy_config_matches(config, strategy, equity)
+    ]
+    return removed_config, save_strategy_configs(remaining_configs, path)
 
 
 def resolve_strategy_display_state(
     strategy_state: dict[str, Any],
-    active_config: dict[str, Any] | None,
+    active_config: Any,
     stop_report: dict[str, Any] | None,
 ) -> dict[str, Any]:
+    active_configs = merge_strategy_configs(active_config)
+    active_configs_by_equity: dict[str, list[dict[str, Any]]] = {}
+    for config in active_configs:
+        active_configs_by_equity.setdefault(config["equity"], []).append(config)
+    if stop_report is not None:
+        for config in normalize_strategy_configs(stop_report.get("stopped_strategy_config")):
+            active_configs_by_equity.setdefault(config["equity"], []).append(config)
+
     stopped_positions = stop_report.get("stopped_positions") if stop_report else []
     has_pending_stop_report = bool(
         stop_report is not None
         and stopped_positions
         and not stop_report.get("error")
     )
-    started_without_position = (
-        active_config is not None
-        and not strategy_state["has_position"]
-        and not has_pending_stop_report
-    )
+    started_without_position = False
 
     if strategy_state["has_position"]:
-        display_strategy = (
-            active_config["strategy"]
-            if active_config is not None
-            and active_config.get("equity") == strategy_state["equity"]
-            else ML_STRATEGY_DISPLAY_NAME
-        )
+        display_rows = []
+        displayed_config_keys = set()
+        for position in strategy_state.get("positions") or []:
+            equity = position.get("equity", "n/a")
+            matching_configs = active_configs_by_equity.get(equity) or []
+            if matching_configs:
+                for config in matching_configs:
+                    displayed_config_keys.add((config["strategy"], config["equity"]))
+                    display_rows.append(
+                        {
+                            "strategy": config["strategy"],
+                            "equity": equity,
+                            "capital_allocation_pct": config["capital_allocation_pct"],
+                            "status": position.get("status", "n/a"),
+                            "status_tooltip": position.get("status_tooltip", ""),
+                        }
+                    )
+                continue
+
+            display_rows.append(
+                {
+                    "strategy": ML_STRATEGY_DISPLAY_NAME,
+                    "equity": equity,
+                    "capital_allocation_pct": None,
+                    "status": position.get("status", "n/a"),
+                    "status_tooltip": position.get("status_tooltip", ""),
+                }
+            )
+
+        for config in active_configs:
+            if (config["strategy"], config["equity"]) in displayed_config_keys:
+                continue
+
+            started_without_position = True
+            display_rows.append(
+                {
+                    "strategy": config["strategy"],
+                    "equity": config["equity"],
+                    "capital_allocation_pct": config["capital_allocation_pct"],
+                    "status": "Flat",
+                    "status_tooltip": "",
+                }
+            )
+
+        if not display_rows:
+            display_rows = [
+                {
+                    "strategy": ML_STRATEGY_DISPLAY_NAME,
+                    "equity": strategy_state["equity"],
+                    "capital_allocation_pct": None,
+                    "status": strategy_state["status"],
+                    "status_tooltip": "",
+                }
+            ]
+
+        display_strategy = display_rows[0]["strategy"]
         display_equity = strategy_state["equity"]
         display_status = strategy_state["status"]
     elif has_pending_stop_report:
-        display_strategy = (
-            active_config["strategy"] if active_config is not None else ML_STRATEGY_DISPLAY_NAME
-        )
         display_equity = stopped_positions[0].get("symbol", "n/a")
         display_status = "Stopped"
-    elif started_without_position:
-        display_strategy = active_config["strategy"]
-        display_equity = active_config["equity"]
-        display_status = "Active (Flat)"
+        display_rows = [
+            {
+                "strategy": (
+                    (active_configs_by_equity.get(
+                        str(position.get("symbol", "") or "").upper(),
+                    ) or [{"strategy": ML_STRATEGY_DISPLAY_NAME}])[0]["strategy"]
+                ),
+                "capital_allocation_pct": (
+                    (active_configs_by_equity.get(
+                        str(position.get("symbol", "") or "").upper(),
+                    ) or [{}])[0].get("capital_allocation_pct")
+                ),
+                "equity": position.get("symbol", "n/a"),
+                "status": display_status,
+                "status_tooltip": "",
+            }
+            for position in stopped_positions
+        ]
+        display_strategy = display_rows[0]["strategy"]
+    elif active_configs:
+        display_rows = [
+            {
+                "strategy": config["strategy"],
+                "equity": config["equity"],
+                "capital_allocation_pct": config["capital_allocation_pct"],
+                "status": "Flat",
+                "status_tooltip": "",
+            }
+            for config in active_configs
+        ]
+        started_without_position = True
+        display_strategy = display_rows[0]["strategy"]
+        display_equity = display_rows[0]["equity"]
+        display_status = display_rows[0]["status"]
     else:
         display_strategy = "None"
-        display_equity = "Flat"
+        display_equity = "None"
         display_status = "Inactive"
+        display_rows = [
+            {
+                "strategy": display_strategy,
+                "equity": display_equity,
+                "capital_allocation_pct": None,
+                "status": display_status,
+                "status_tooltip": "",
+            }
+        ]
 
     return {
         "display_strategy": display_strategy,
         "display_equity": display_equity,
         "display_status": display_status,
+        "display_rows": display_rows,
         "has_pending_stop_report": has_pending_stop_report,
         "started_without_position": started_without_position,
         "stopped_positions": stopped_positions or [],
@@ -328,17 +681,37 @@ def build_strategy_cancel_error_report(
 def build_strategy_start_state(
     strategy: str,
     equity: str,
+    probability_threshold: float | None = None,
+    capital_allocation_pct: float | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     started_at = pd.Timestamp.now(tz="UTC")
+    active_capital_allocation = _strategy_capital_allocation(capital_allocation_pct)
     active_config = {
         "strategy": strategy,
         "equity": equity,
         "started_at": started_at,
+        "capital_allocation_pct": active_capital_allocation,
     }
+    capital_text = (
+        f" Capital allocation: {active_capital_allocation * 100:g}% "
+        "of available cash."
+    )
+    threshold_text = ""
+    if strategy == ML_STRATEGY_DISPLAY_NAME:
+        active_config["probability_threshold"] = _strategy_probability_threshold(
+            probability_threshold
+        )
+        threshold_text = (
+            f" Probability threshold: "
+            f"{active_config['probability_threshold']:.2f}."
+        )
+
     start_report = {
         "message": (
             f"Started {strategy} on {equity}. "
             "The strategy is active in flat mode until a paper position is opened."
+            f"{threshold_text}"
+            f"{capital_text}"
         ),
         "started_at": started_at,
     }
@@ -553,7 +926,6 @@ def positions_to_dataframe(
             {
                 "Symbol": position_symbol(position),
                 "Side": (enum_text(object_field(position, "side")) or "long").title(),
-                "Allocation": format_percent(allocation),
                 "Qty": format_plain_number(object_field(position, "qty")),
                 "Avg Price": format_money(object_field(position, "avg_entry_price"), currency=""),
                 "Current Price": format_money(object_field(position, "current_price"), currency=""),
@@ -561,6 +933,7 @@ def positions_to_dataframe(
                 "Cost Basis": format_money(cost_basis),
                 "Unrealized P&L": format_money(unrealized),
                 "Unrealized %": format_percent(object_field(position, "unrealized_plpc")),
+                "Allocation": format_percent(allocation),
                 "Daily P&L": format_money(object_field(position, "unrealized_intraday_pl")),
                 "_sort": abs(market_value or 0.0),
             }
@@ -571,7 +944,6 @@ def positions_to_dataframe(
             columns=[
                 "Symbol",
                 "Side",
-                "Allocation",
                 "Qty",
                 "Avg Price",
                 "Current Price",
@@ -579,6 +951,7 @@ def positions_to_dataframe(
                 "Cost Basis",
                 "Unrealized P&L",
                 "Unrealized %",
+                "Allocation",
                 "Daily P&L",
             ]
         )
@@ -694,14 +1067,19 @@ def get_current_position(
     return float(position.qty)
 
 
-def get_latest_signal(signal_df: pd.DataFrame) -> dict[str, Any]:
-    """Extract the latest usable ML signal row from a model-generated signal DataFrame."""
-    required_columns = {"close", "ml_probability", "ml_position"}
+def get_latest_signal(
+    signal_df: pd.DataFrame,
+    position_col: str = "ml_position",
+    probability_col: str | None = "ml_probability",
+    trade_signal_col: str = "ml_trade_signal",
+) -> dict[str, Any]:
+    """Extract the latest usable long/flat signal row from a signal DataFrame."""
+    required_columns = {"close", position_col}
     missing = sorted(required_columns - set(signal_df.columns))
     if missing:
         raise ValueError(f"Signal DataFrame is missing required columns: {missing}")
 
-    ready = signal_df.dropna(subset=["close", "ml_probability", "ml_position"])
+    ready = signal_df.dropna(subset=["close", position_col])
     if ready.empty:
         raise ValueError("Signal DataFrame does not contain a usable latest signal row.")
 
@@ -711,12 +1089,19 @@ def get_latest_signal(signal_df: pd.DataFrame) -> dict[str, Any]:
         if "timestamp" in ready.columns and pd.notna(latest["timestamp"])
         else None
     )
-    latest_position = int(latest["ml_position"])
-    probability = float(latest["ml_probability"])
+    latest_position = int(latest[position_col])
+    if (
+        probability_col is not None
+        and probability_col in ready.columns
+        and pd.notna(latest[probability_col])
+    ):
+        probability = float(latest[probability_col])
+    else:
+        probability = float(latest_position)
     close_price = float(latest["close"])
     trade_signal = (
-        int(latest["ml_trade_signal"])
-        if "ml_trade_signal" in ready.columns and pd.notna(latest["ml_trade_signal"])
+        int(latest[trade_signal_col])
+        if trade_signal_col in ready.columns and pd.notna(latest[trade_signal_col])
         else None
     )
 
@@ -738,8 +1123,8 @@ def build_order_plan(
     available_cash: float | None = None,
 ) -> OrderPlan:
     """Convert latest long/flat signal and current paper position into an order plan."""
-    if notional <= 0:
-        raise ValueError("notional must be positive.")
+    if notional < 0:
+        raise ValueError("notional cannot be negative.")
 
     close_price = float(latest_signal["close_price"])
     if close_price <= 0:
@@ -861,6 +1246,10 @@ def execute_latest_signal(
     trading_client: TradingClient | None = None,
     dry_run: bool = False,
     risk_config: RiskConfig | None = None,
+    position_col: str = "ml_position",
+    probability_col: str | None = "ml_probability",
+    trade_signal_col: str = "ml_trade_signal",
+    probability_label: str | None = "P(next-day up)",
 ) -> ExecutionReport:
     """
     Execute the latest model signal in Alpaca paper trading.
@@ -882,15 +1271,22 @@ def execute_latest_signal(
         log_lines.append(message)
 
     client = trading_client or get_paper_trading_client(settings)
-    latest_signal = get_latest_signal(signal_df)
+    latest_signal = get_latest_signal(
+        signal_df,
+        position_col=position_col,
+        probability_col=probability_col,
+        trade_signal_col=trade_signal_col,
+    )
     signal_label = str(latest_signal["label"])
 
     log(f"=== Paper execution run for {symbol} ===")
-    log(
-        f"Latest signal: {signal_label} | "
-        f"P(next-day up)={float(latest_signal['probability']):.4f} | "
-        f"close={float(latest_signal['close_price']):.2f}"
-    )
+    signal_parts = [f"Latest signal: {signal_label}"]
+    if probability_label is not None:
+        signal_parts.append(
+            f"{probability_label}={float(latest_signal['probability']):.4f}"
+        )
+    signal_parts.append(f"close={float(latest_signal['close_price']):.2f}")
+    log(" | ".join(signal_parts))
 
     clock = client.get_clock()
     log(f"Market open: {clock.is_open} (next open {clock.next_open}, next close {clock.next_close})")
@@ -954,6 +1350,189 @@ def execute_latest_signal(
         message=order_plan.reason,
         log_lines=log_lines,
     )
+
+
+def execute_ml_logistic_regression_strategy(
+    symbol: str,
+    probability_threshold: float = ML_PROBABILITY_THRESHOLD_DEFAULT,
+    capital_allocation_pct: float = STRATEGY_CAPITAL_ALLOCATION_DEFAULT,
+    years: int = ML_EXECUTION_LOOKBACK_YEARS,
+    test_size: float = ML_EXECUTION_TEST_SIZE,
+    variance_threshold: float = ML_EXECUTION_VARIANCE_THRESHOLD,
+    settings: AlpacaSettings | None = None,
+    trading_client: TradingClient | None = None,
+    dry_run: bool = False,
+    risk_config: RiskConfig | None = None,
+) -> ExecutionReport:
+    """Run the ML signal workflow and submit the latest paper-trading decision."""
+    from src.features import build_feature_pca_pipeline
+    from src.historical import fetch_daily_ohlcv
+    from src.models import run_ml_signal_pipeline
+
+    normalized_symbol = symbol.strip().upper()
+    if not normalized_symbol:
+        raise ValueError("ML strategy execution requires an equity symbol.")
+
+    threshold = _strategy_probability_threshold(probability_threshold)
+    allocation = _strategy_capital_allocation(capital_allocation_pct)
+    logger = get_paper_trading_logger()
+
+    logger.info("=== ML Logistic Regression workflow for %s ===", normalized_symbol)
+    logger.info(
+        "ML settings: probability threshold %.4f | capital allocation %.2f%% of available cash.",
+        threshold,
+        allocation * 100,
+    )
+
+    try:
+        price_df = fetch_daily_ohlcv(
+            normalized_symbol,
+            years=years,
+            feed_name=settings.data_feed if settings is not None else None,
+        )
+        if price_df.empty:
+            raise ValueError(f"No daily OHLCV rows returned for {normalized_symbol}.")
+
+        pca_result = build_feature_pca_pipeline(
+            price_df,
+            price_col="close",
+            test_size=test_size,
+            variance_threshold=variance_threshold,
+        )
+        ml_signal_result = run_ml_signal_pipeline(
+            pca_result,
+            probability_threshold=threshold,
+            trade_on_test_only=True,
+        )
+
+        client = trading_client or get_paper_trading_client(settings)
+        account = client.get_account()
+        available_cash = max(to_float(object_field(account, "cash")) or 0.0, 0.0)
+        notional = available_cash * allocation
+        logger.info(
+            "Capital allocation resolved to $%.2f notional from $%.2f available cash.",
+            notional,
+            available_cash,
+        )
+
+        return execute_latest_signal(
+            normalized_symbol,
+            ml_signal_result.signal_df,
+            notional=notional,
+            settings=settings,
+            trading_client=client,
+            dry_run=dry_run,
+            risk_config=risk_config,
+        )
+    except Exception:
+        logger.exception(
+            "ML Logistic Regression workflow failed for %s.", normalized_symbol
+        )
+        raise
+
+
+def _rule_based_strategy_spec(strategy: str) -> dict[str, Any]:
+    from src.strategies import (
+        generate_custom_multifactor_signals,
+        generate_macd_sma_trend_signals,
+        generate_rsi_bollinger_mean_reversion_signals,
+    )
+
+    specs = {
+        "Trend-following": {
+            "signal_function": generate_macd_sma_trend_signals,
+            "position_col": "trend_position",
+            "trade_signal_col": "trend_trade_signal",
+        },
+        "Mean-reversion": {
+            "signal_function": generate_rsi_bollinger_mean_reversion_signals,
+            "position_col": "mean_reversion_position",
+            "trade_signal_col": "mean_reversion_trade_signal",
+        },
+        "Multi-factor": {
+            "signal_function": generate_custom_multifactor_signals,
+            "position_col": "custom_position",
+            "trade_signal_col": "custom_trade_signal",
+        },
+    }
+
+    try:
+        return specs[strategy]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported rule-based strategy: {strategy}") from exc
+
+
+def execute_rule_based_strategy(
+    strategy: str,
+    symbol: str,
+    capital_allocation_pct: float = STRATEGY_CAPITAL_ALLOCATION_DEFAULT,
+    years: int = RULE_BASED_EXECUTION_LOOKBACK_YEARS,
+    settings: AlpacaSettings | None = None,
+    trading_client: TradingClient | None = None,
+    dry_run: bool = False,
+    risk_config: RiskConfig | None = None,
+) -> ExecutionReport:
+    """Run a rule-based daily-bar signal workflow and submit the latest decision."""
+    from src.historical import fetch_daily_ohlcv
+
+    normalized_symbol = symbol.strip().upper()
+    if not normalized_symbol:
+        raise ValueError("Rule-based strategy execution requires an equity symbol.")
+
+    spec = _rule_based_strategy_spec(strategy)
+    allocation = _strategy_capital_allocation(capital_allocation_pct)
+    logger = get_paper_trading_logger()
+
+    logger.info(
+        "=== %s daily rule-based workflow for %s ===",
+        strategy,
+        normalized_symbol,
+    )
+    logger.info(
+        "Rule-based settings: daily bars | capital allocation %.2f%% of available cash.",
+        allocation * 100,
+    )
+
+    try:
+        price_df = fetch_daily_ohlcv(
+            normalized_symbol,
+            years=years,
+            feed_name=settings.data_feed if settings is not None else None,
+        )
+        if price_df.empty:
+            raise ValueError(f"No daily OHLCV rows returned for {normalized_symbol}.")
+
+        signal_df = spec["signal_function"](price_df, price_col="close")
+        client = trading_client or get_paper_trading_client(settings)
+        account = client.get_account()
+        available_cash = max(to_float(object_field(account, "cash")) or 0.0, 0.0)
+        notional = available_cash * allocation
+        logger.info(
+            "Capital allocation resolved to $%.2f notional from $%.2f available cash.",
+            notional,
+            available_cash,
+        )
+
+        return execute_latest_signal(
+            normalized_symbol,
+            signal_df,
+            notional=notional,
+            settings=settings,
+            trading_client=client,
+            dry_run=dry_run,
+            risk_config=risk_config,
+            position_col=spec["position_col"],
+            probability_col=None,
+            trade_signal_col=spec["trade_signal_col"],
+            probability_label=None,
+        )
+    except Exception:
+        logger.exception(
+            "%s daily rule-based workflow failed for %s.",
+            strategy,
+            normalized_symbol,
+        )
+        raise
 
 
 def summarize_close_position_response(response: Any) -> dict[str, str]:
@@ -1034,6 +1613,121 @@ def stop_all_paper_positions() -> dict[str, Any]:
     }
 
 
+def cancel_open_orders_for_symbol(
+    client: TradingClient,
+    symbol: str,
+) -> list[dict[str, str]]:
+    open_orders = normalize_records(
+        client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN))
+    )
+    canceled_orders = []
+    for order in open_orders:
+        order_symbol = str(object_field(order, "symbol", "") or "").upper()
+        if order_symbol != symbol:
+            continue
+
+        order_id = str(object_field(order, "id", "") or "")
+        if not order_id:
+            canceled_orders.append(
+                {
+                    "Symbol": symbol,
+                    "Order ID": "n/a",
+                    "Status": "Cancel skipped: missing order id",
+                }
+            )
+            continue
+
+        try:
+            client.cancel_order_by_id(order_id)
+        except Exception as exc:
+            canceled_orders.append(
+                {
+                    "Symbol": symbol,
+                    "Order ID": order_id,
+                    "Status": f"Cancel failed: {exc}",
+                }
+            )
+            continue
+
+        canceled_orders.append(
+            {
+                "Symbol": symbol,
+                "Order ID": order_id,
+                "Status": "Canceled open order",
+            }
+        )
+
+    return canceled_orders
+
+
+def find_open_position_for_symbol(positions: list[Any], symbol: str) -> Any | None:
+    for position in positions:
+        position_symbol_value = str(object_field(position, "symbol", "") or "").upper()
+        qty = to_float(object_field(position, "qty")) or 0.0
+        if position_symbol_value == symbol and abs(qty) > 1e-9:
+            return position
+
+    return None
+
+
+def stop_strategy(strategy: str, equity: str) -> dict[str, Any]:
+    logger = get_paper_trading_logger()
+    client = get_paper_trading_client()
+    _, symbol = _strategy_identity(strategy, equity)
+    if not symbol:
+        raise ValueError("Strategy stop requires an equity symbol.")
+
+    configs = load_strategy_configs()
+    stopped_strategy_config = next(
+        (
+            config
+            for config in configs
+            if strategy_config_matches(config, strategy, symbol)
+        ),
+        None,
+    )
+    remaining_configs = [
+        config
+        for config in configs
+        if not strategy_config_matches(config, strategy, symbol)
+    ]
+
+    logger.info("=== Strategy STOP requested for %s on %s ===", strategy, symbol)
+    canceled_orders = cancel_open_orders_for_symbol(client, symbol)
+    positions = normalize_records(client.get_all_positions())
+    open_position = find_open_position_for_symbol(positions, symbol)
+    stopped_positions = (
+        [summarize_stopped_position(open_position)]
+        if open_position is not None
+        else []
+    )
+
+    close_orders = []
+    if open_position is not None:
+        response = client.close_position(symbol)
+        close_orders = [summarize_close_position_response(response)]
+        logger.info("STOP request submitted close-position for %s.", symbol)
+    else:
+        logger.info("STOP request for %s found no open paper position.", symbol)
+
+    active_configs = save_strategy_configs(remaining_configs)
+    action_text = (
+        f"submitted a close request for {symbol}"
+        if open_position is not None
+        else "found no open paper position"
+    )
+
+    return {
+        "message": f"Stopped {strategy} on {symbol}; {action_text}.",
+        "closed_count": 1 if open_position is not None else 0,
+        "orders": canceled_orders + close_orders,
+        "stopped_positions": stopped_positions,
+        "stopped_strategy_config": stopped_strategy_config,
+        "active_configs": active_configs,
+        "stopped_at": pd.Timestamp.now(tz="UTC"),
+    }
+
+
 def _order_quantity(value: float) -> int | float:
     if abs(value - round(value)) < 1e-9:
         return int(round(value))
@@ -1106,9 +1800,17 @@ def reactivate_stopped_strategy(stop_report: dict[str, Any]) -> dict[str, Any]:
     if not submitted_orders:
         raise ValueError("No valid stopped position was available to reactivate.")
 
+    stopped_strategy_config = stop_report.get("stopped_strategy_config")
+    active_configs = None
+    if isinstance(stopped_strategy_config, dict):
+        active_configs = save_strategy_configs(
+            load_strategy_configs() + [stopped_strategy_config]
+        )
+
     return {
         "message": "Submitted strategy reactivation order.",
         "orders": submitted_orders,
         "source_stopped_at": str(stop_report.get("stopped_at")),
         "reactivated_at": pd.Timestamp.now(tz="UTC"),
+        "active_configs": active_configs,
     }
