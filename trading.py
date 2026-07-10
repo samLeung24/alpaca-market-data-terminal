@@ -43,6 +43,7 @@ from src.plots import (
     prepare_historical_display_df,
     selected_lower_indicator_windows,
 )
+from src.risk import render_risk_management_panel
 
 
 st.set_page_config(page_title="Alpaca Market Data Terminal", layout="wide")
@@ -1075,5 +1076,7 @@ with equity_panel:
 
 with trading_panel:
     render_strategy_management_panel(equity_options, equity_by_label)
+    st.divider()
+    render_risk_management_panel()
     st.divider()
     render_paper_account_panel()

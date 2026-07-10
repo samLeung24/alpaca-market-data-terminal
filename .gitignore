@@ -6,3 +6,4 @@ __pycache__/
 .streamlit/secrets.toml
 SKILL.md
 logs/
+risk_config.json

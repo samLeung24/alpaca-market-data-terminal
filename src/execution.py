@@ -19,6 +19,7 @@ from alpaca.trading.requests import (
 
 from src.config import AlpacaSettings
 from src.data_connector import get_paper_trading_client
+from src.risk import RiskConfig, apply_risk_to_order_plan, load_risk_config
 from src.formatting import (
     EASTERN_TZ,
     enum_text,
@@ -859,6 +860,7 @@ def execute_latest_signal(
     settings: AlpacaSettings | None = None,
     trading_client: TradingClient | None = None,
     dry_run: bool = False,
+    risk_config: RiskConfig | None = None,
 ) -> ExecutionReport:
     """
     Execute the latest model signal in Alpaca paper trading.
@@ -867,6 +869,10 @@ def execute_latest_signal(
     apply PCA, train a model, or generate ML signals. It receives the model
     output and handles only paper-account inspection, order planning, order
     submission, and logging.
+
+    BUY plans are passed through the risk module's allocation cap. When
+    risk_config is None the settings saved from the terminal's Risk Controls
+    panel (or the defaults) are used; pass RiskConfig(enabled=False) to bypass.
     """
     logger = get_paper_trading_logger()
     log_lines: list[str] = []
@@ -892,6 +898,7 @@ def execute_latest_signal(
     current_position = get_current_position(symbol, trading_client=client)
     log(f"Current paper position in {symbol}: {current_position:g} shares")
 
+    account = None
     available_cash = None
     if int(latest_signal["position"]) == 1 and current_position <= 0:
         account = client.get_account()
@@ -905,6 +912,17 @@ def execute_latest_signal(
         available_cash=available_cash,
     )
     log(f"Order plan: {order_plan.action} | {order_plan.reason}")
+
+    if order_plan.action == "BUY" and account is not None:
+        active_risk_config = risk_config if risk_config is not None else load_risk_config()
+        risk_checked_plan = apply_risk_to_order_plan(
+            order_plan,
+            portfolio_value=account_portfolio_value(account),
+            config=active_risk_config,
+        )
+        if risk_checked_plan is not order_plan:
+            order_plan = risk_checked_plan
+            log(f"Risk check: {order_plan.action} | {order_plan.reason}")
 
     order = None
     if not dry_run and order_plan.action in {"BUY", "SELL"}:
