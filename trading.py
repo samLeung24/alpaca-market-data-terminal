@@ -26,6 +26,16 @@ from src.execution import (
     ML_PROBABILITY_THRESHOLD_MAX,
     ML_PROBABILITY_THRESHOLD_MIN,
     merge_strategy_configs,
+    account_details_dataframe,
+    account_portfolio_value,
+    build_account_cards,
+    build_strategy_cancel_error_report,
+    build_strategy_start_state,
+    build_strategy_stop_error_report,
+    fetch_current_strategy_state,
+    fetch_paper_account_snapshot,
+    fetch_portfolio_history_dataframe,
+    ML_STRATEGY_DISPLAY_NAME,
     orders_to_dataframe,
     orders_to_exchange_log_dataframe,
     positions_to_dataframe,
@@ -37,6 +47,22 @@ from src.execution import (
     STRATEGY_CAPITAL_ALLOCATION_DEFAULT,
     STRATEGY_CAPITAL_ALLOCATION_MAX,
     STRATEGY_CAPITAL_ALLOCATION_MIN,
+    stop_all_paper_positions,
+)
+from src.formatting import format_datetime
+from src.historical import (
+    RANGE_PRESETS,
+    fetch_historical_chart_bars,
+    resolve_date_range,
+    resolve_tick_spec,
+)
+from src.indicators import add_selected_indicators
+from src.live_quotes import get_live_quote_manager
+from src.plots import (
+    add_lower_indicator_window,
+    add_selected_indicator_traces,
+    prepare_historical_display_df,
+    selected_lower_indicator_windows,
 )
 from src.formatting import format_datetime
 from src.historical import (
@@ -711,6 +737,255 @@ def _render_start_trading_controls(
     if not start_submitted:
         return
 
+
+    st.markdown(
+        """
+        <style>
+        .equity-quote-row {
+            display: flex;
+            align-items: baseline;
+            gap: 1.2rem;
+            flex-wrap: wrap;
+            margin: -0.2rem 0 0.8rem;
+        }
+        .equity-quote-item {
+            display: inline-flex;
+            align-items: baseline;
+            gap: 0.32rem;
+            min-width: 5.2rem;
+        }
+        .equity-quote-label {
+            color: #6b7280;
+            font-size: var(--terminal-font-sm);
+            font-weight: 600;
+        }
+        .equity-quote-value {
+            color: #31333f;
+            font-size: var(--terminal-font-lg);
+            font-weight: 650;
+            line-height: 1.2;
+        }
+        .equity-quote-updated {
+            color: #6b7280;
+            font-size: var(--terminal-font-xs);
+            margin: -0.35rem 0 0.9rem;
+        }
+        </style>
+        """
+        f'<div class="equity-quote-row">{quote_html}</div>'
+        f'<div class="equity-quote-updated">{html.escape(str(updated_text))}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _paper_account_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        .paper-account-shell {
+            background: #ffffff;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 0.55rem;
+            margin: 0.25rem 0 0.65rem;
+        }
+        .paper-card-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 0.5rem;
+        }
+        .paper-card {
+            background: #f9fafb;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 0.55rem 0.65rem;
+            min-height: 62px;
+        }
+        .paper-card-label {
+            color: #6b7280;
+            font-size: var(--terminal-font-sm);
+            font-weight: 650;
+            line-height: 1.2;
+            margin-bottom: 0.22rem;
+        }
+        .paper-card-value {
+            color: #111827;
+            font-size: var(--terminal-font-md);
+            font-weight: 750;
+            line-height: 1.18;
+            overflow-wrap: anywhere;
+        }
+        .paper-card-value.positive {
+            color: #1abc9c;
+        }
+        .paper-card-value.negative {
+            color: #e74c3c;
+        }
+        .paper-card-note {
+            color: #6b7280;
+            font-size: var(--terminal-font-xs);
+            margin-top: 0.25rem;
+            line-height: 1.25;
+            overflow-wrap: anywhere;
+        }
+        @media (max-width: 720px) {
+            .paper-card-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_metric_cards(cards: list[dict[str, str]]) -> None:
+    card_html = []
+    display_cards = [card for card in cards if card.get("label") != "Recent Order"]
+    for card in display_cards:
+        value_class = html.escape(card.get("class", "neutral"))
+        card_html.append(
+            '<div class="paper-card">'
+            f'<div class="paper-card-label">{html.escape(card["label"])}</div>'
+            f'<div class="paper-card-value {value_class}">{html.escape(card["value"])}</div>'
+            f'<div class="paper-card-note">{html.escape(card["note"])}</div>'
+            "</div>"
+        )
+
+    st.markdown(
+        '<div class="paper-account-shell">'
+        '<div class="paper-card-grid">'
+        f'{"".join(card_html)}'
+        "</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _render_strategy_status(
+    strategy: str,
+    equity: str,
+    status: str,
+) -> None:
+    items = [
+        ("Strategy", strategy, "strategy"),
+        ("Equity", equity, "equity"),
+        ("Status", status, "status"),
+    ]
+    item_html = "".join(
+        '<div class="strategy-status-item">'
+        f'<div class="strategy-status-label">{html.escape(label)}</div>'
+        f'<div class="strategy-status-value {css_class}">{html.escape(value)}</div>'
+        "</div>"
+        for label, value, css_class in items
+    )
+    st.markdown(
+        """
+        <style>
+        .strategy-status-grid {
+            display: grid;
+            grid-template-columns: minmax(0, 1.35fr) minmax(0, 0.75fr) minmax(0, 0.9fr);
+            gap: 0.85rem;
+            margin: 0.4rem 0 1rem;
+        }
+        .strategy-status-label {
+            color: #31333f;
+            font-size: var(--terminal-font-sm);
+            font-weight: 600;
+            line-height: 1.2;
+            margin-bottom: 0.35rem;
+        }
+        .strategy-status-value {
+            color: #31333f;
+            font-size: var(--terminal-font-lg);
+            font-weight: 500;
+            line-height: 1.15;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .strategy-status-value.equity,
+        .strategy-status-value.status {
+            font-size: var(--terminal-font-lg);
+        }
+        </style>
+        """
+        f'<div class="strategy-status-grid">{item_html}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _strategy_start_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stForm"] button[kind="primary"] {
+            background: #1abc9c;
+            border-color: #1abc9c;
+            color: #ffffff;
+        }
+        div[data-testid="stForm"] button[kind="primary"]:hover {
+            background: #159a80;
+            border-color: #159a80;
+            color: #ffffff;
+        }
+        div[data-testid="stForm"] button[kind="primary"]:focus {
+            box-shadow: 0 0 0 0.2rem rgba(26, 188, 156, 0.25);
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_start_trading_controls(
+    start_equity_options: list[str],
+    equity_by_label: dict[str, CompanyMatch],
+) -> None:
+    _strategy_start_styles()
+    has_equity_options = len(start_equity_options) > 1
+
+    with st.form("strategy_start_launcher_form"):
+        start_form_requested = st.form_submit_button(
+            "Start Trading",
+            type="primary",
+            width="stretch",
+            disabled=not has_equity_options,
+        )
+
+    if not has_equity_options:
+        st.caption("No equity universe is available for strategy startup.")
+
+    if start_form_requested:
+        st.session_state[STRATEGY_START_FORM_STATE_KEY] = True
+
+    if not st.session_state.get(STRATEGY_START_FORM_STATE_KEY, False):
+        return
+
+    with st.form("strategy_start_form"):
+        selected_equity_label = st.selectbox(
+            "Equity",
+            options=start_equity_options,
+            key="strategy_start_equity_selection",
+        )
+        selected_strategy = st.selectbox(
+            "Strategy",
+            options=STRATEGY_START_OPTIONS,
+            key="strategy_start_selection",
+        )
+        start_submitted = st.form_submit_button(
+            "Start",
+            type="primary",
+            width="stretch",
+        )
+        st.warning(
+            "Before proceeding, test this strategy in the Backtesting module "
+            "for the selected equity and review its risk and performance."
+        )
+
+    if not start_submitted:
+        return
+
     selected_equity = equity_by_label.get(selected_equity_label)
     if selected_equity is None:
         st.warning("Select an equity before starting a trading strategy.")
@@ -778,6 +1053,8 @@ def _render_start_trading_controls(
             )
 
     st.session_state[STRATEGY_ACTIVE_CONFIG_STATE_KEY] = active_configs
+    active_config, start_report = build_strategy_start_state(selected_strategy, symbol)
+    st.session_state[STRATEGY_ACTIVE_CONFIG_STATE_KEY] = active_config
     st.session_state[STRATEGY_START_REPORT_STATE_KEY] = start_report
     st.session_state[STRATEGY_START_FORM_STATE_KEY] = False
     st.session_state.pop(STRATEGY_STOP_REPORT_STATE_KEY, None)
@@ -893,6 +1170,8 @@ def _render_portfolio_history_panel() -> None:
 
 @st.fragment(run_every=PAPER_ACCOUNT_REFRESH_SECONDS)
 def render_paper_account_panel() -> None:
+    _paper_account_styles()
+
     title_col, action_col = st.columns([0.9, 0.1], vertical_alignment="center")
     with title_col:
         st.subheader("Paper Account")
@@ -1012,6 +1291,104 @@ def render_strategy_management_panel(
     stop_request = _render_strategy_status(display_state["display_rows"])
 
     render_risk_management_panel(show_heading=False, show_position_table=False)
+    tab_overview, tab_holdings, tab_transactions = st.tabs(
+        ["Overview", "Holdings", "Transactions"]
+    )
+
+    with tab_overview:
+        st.markdown("**Account Details**")
+        st.dataframe(
+            account_details_dataframe(account, positions, orders),
+            hide_index=True,
+            width="stretch",
+        )
+
+    with tab_holdings:
+        holdings_df = positions_to_dataframe(positions, portfolio_value)
+        if holdings_df.empty:
+            st.info("No open paper positions.")
+        else:
+            st.dataframe(holdings_df, hide_index=True, width="stretch")
+
+    with tab_transactions:
+        order_history_df = orders_to_dataframe(orders)
+        exchange_log_df = orders_to_exchange_log_dataframe(orders)
+
+        st.markdown("**Order History**")
+        if order_history_df.empty:
+            st.info("No recent paper orders returned by Alpaca.")
+        else:
+            st.dataframe(
+                order_history_df,
+                hide_index=True,
+                width="stretch",
+                height=TRANSACTION_TABLE_HEIGHT,
+                row_height=TRANSACTION_TABLE_ROW_HEIGHT,
+            )
+
+        st.markdown("**Alpaca Order Event Log**")
+        if exchange_log_df.empty:
+            st.info("No exchange order events returned by Alpaca.")
+        else:
+            st.dataframe(
+                exchange_log_df,
+                hide_index=True,
+                width="stretch",
+                height=TRANSACTION_TABLE_HEIGHT,
+                row_height=TRANSACTION_TABLE_ROW_HEIGHT,
+            )
+
+        st.markdown("**Local Execution Log**")
+        st.code(
+            read_paper_trading_log(max_lines=160),
+            language="text",
+            height=LOCAL_LOG_HEIGHT,
+        )
+
+
+def render_strategy_management_panel(
+    start_equity_options: list[str],
+    equity_by_label: dict[str, CompanyMatch],
+) -> None:
+    st.subheader("Trading Strategy Management")
+
+    try:
+        strategy_state = fetch_current_strategy_state()
+    except Exception as exc:
+        strategy_state = {
+            "equity": "n/a",
+            "status": "Unavailable",
+            "has_position": False,
+            "error": str(exc),
+        }
+
+    active_config = st.session_state.get(STRATEGY_ACTIVE_CONFIG_STATE_KEY)
+    report = st.session_state.get(STRATEGY_STOP_REPORT_STATE_KEY)
+    display_state = resolve_strategy_display_state(
+        strategy_state,
+        active_config,
+        report,
+    )
+
+    _render_strategy_status(
+        display_state["display_strategy"],
+        display_state["display_equity"],
+        display_state["display_status"],
+    )
+
+    if strategy_state["has_position"]:
+        stop_col, info_col = st.columns([0.22, 0.78], vertical_alignment="center")
+        with stop_col:
+            stop_clicked = st.button(
+                "STOP",
+                key=f"strategy_stop_all_{strategy_state['equity']}",
+                type="primary",
+                width="stretch",
+            )
+        with info_col:
+            st.caption("STOP cancels open paper orders and submits closing orders for all open paper positions.")
+    else:
+        stop_clicked = False
 
     if strategy_state.get("error"):
         st.warning(f"Could not load current paper holding: {strategy_state['error']}")
@@ -1038,6 +1415,23 @@ def render_strategy_management_panel(
                 st.session_state[STRATEGY_ACTIVE_CONFIG_STATE_KEY] = (
                     stop_report.get("active_configs") or []
                 )
+    if (
+        not strategy_state["has_position"]
+        and not display_state["has_pending_stop_report"]
+        and active_config is None
+    ):
+        _render_start_trading_controls(start_equity_options, equity_by_label)
+
+    start_report = st.session_state.get(STRATEGY_START_REPORT_STATE_KEY)
+    if display_state["started_without_position"] and start_report is not None:
+        started_at = start_report.get("started_at")
+        started_text = format_datetime(started_at) if started_at is not None else "n/a"
+        st.success(f"{start_report.get('message', '')} Started at: {started_text}.")
+
+    if stop_clicked:
+        with st.spinner("Submitting close-all request to Alpaca paper trading..."):
+            try:
+                st.session_state[STRATEGY_STOP_REPORT_STATE_KEY] = stop_all_paper_positions()
                 st.session_state.pop(STRATEGY_CANCEL_REPORT_STATE_KEY, None)
                 st.session_state.pop(STRATEGY_START_REPORT_STATE_KEY, None)
             except Exception as exc:
@@ -1090,6 +1484,7 @@ def render_strategy_management_panel(
                         st.session_state[STRATEGY_ACTIVE_CONFIG_STATE_KEY] = (
                             cancel_result["active_configs"]
                         )
+                    st.session_state[STRATEGY_CANCEL_REPORT_STATE_KEY] = reactivate_stopped_strategy(report)
                 except Exception as exc:
                     st.session_state[STRATEGY_CANCEL_REPORT_STATE_KEY] = (
                         build_strategy_cancel_error_report(exc, source_stopped_at)
@@ -1287,6 +1682,7 @@ with equity_panel:
                     bars = fetch_historical_chart_bars(
                         symbol=symbol,
                         start=fetch_start,
+                        start=range_start,
                         end=range_end,
                         timeframe_value=timeframe_value,
                         timeframe_unit=timeframe_unit,
@@ -1311,6 +1707,27 @@ with equity_panel:
                 analysis_df["timestamp"],
                 utc=True,
                 errors="coerce",
+            display_df = prepare_historical_display_df(analysis_df, timeframe_unit)
+            lower_windows = selected_lower_indicator_windows(
+                display_df,
+                selected_indicators,
+            )
+            rows = 2 + len(lower_windows)
+            if lower_windows:
+                row_heights = [
+                    0.58,
+                    0.16,
+                    *([0.26 / len(lower_windows)] * len(lower_windows)),
+                ]
+            else:
+                row_heights = [0.74, 0.26]
+
+            fig = make_subplots(
+                rows=rows,
+                cols=1,
+                shared_xaxes=True,
+                row_heights=row_heights,
+                vertical_spacing=0.025,
             )
             analysis_df = analysis_df.loc[visible_timestamps >= range_start].copy()
 
@@ -1368,6 +1785,76 @@ with equity_panel:
                     row=1,
                     col=1,
                 )
+            fig.add_trace(
+                go.Candlestick(
+                    x=display_df["timestamp"],
+                    open=display_df["open"],
+                    high=display_df["high"],
+                    low=display_df["low"],
+                    close=display_df["close"],
+                    name="Price",
+                    increasing_line_color=BULLISH_COLOR,
+                    increasing_fillcolor=BULLISH_COLOR,
+                    decreasing_line_color=BEARISH_COLOR,
+                    decreasing_fillcolor=BEARISH_COLOR,
+                ),
+                row=1,
+                col=1,
+            )
+
+            add_selected_indicator_traces(
+                fig,
+                display_df,
+                selected_indicators,
+                row=1,
+                col=1,
+            )
+
+            volume_colors = [
+                BULLISH_BAR_COLOR
+                if close >= open_
+                else BEARISH_BAR_COLOR
+                for open_, close in zip(display_df["open"], display_df["close"])
+            ]
+            fig.add_trace(
+                go.Bar(
+                    x=display_df["timestamp"],
+                    y=display_df["volume"],
+                    name="Volume",
+                    marker_color=volume_colors,
+                    opacity=0.85,
+                    showlegend=False,
+                ),
+                row=2,
+                col=1,
+            )
+
+            for offset, indicator_name in enumerate(lower_windows, start=3):
+                add_lower_indicator_window(fig, display_df, indicator_name, offset)
+
+            fig.update_layout(
+                height=640 + 115 * len(lower_windows),
+                margin={"l": 15, "r": 15, "t": 20, "b": 60},
+                xaxis_rangeslider_visible=False,
+                bargap=0,
+                legend={
+                    "orientation": "h",
+                    "yanchor": "top",
+                    "y": -0.12,
+                    "xanchor": "center",
+                    "x": 0.5,
+                    "font": {"size": 10},
+                    "itemsizing": "constant",
+                },
+            )
+
+            fig.update_yaxes(title_text="Price", row=1, col=1)
+            fig.update_yaxes(title_text="Volume", row=2, col=1)
+            fig.update_xaxes(
+                title_text="Time (E.T.)",
+                row=rows,
+                col=1,
+            )
 
                 volume_colors = [
                     BULLISH_BAR_COLOR
@@ -1429,3 +1916,13 @@ with trading_panel:
     render_paper_account_panel()
     st.divider()
     render_strategy_management_panel(equity_options, equity_by_label)
+            # Fixed deprecation warning:
+            # use_container_width=True -> width="stretch"
+            with table_area.expander("OHLCV Table", expanded=False):
+                st.dataframe(display_df.tail(50), width="stretch")
+
+
+with trading_panel:
+    render_strategy_management_panel(equity_options, equity_by_label)
+    st.divider()
+    render_paper_account_panel()
