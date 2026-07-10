@@ -9,6 +9,10 @@ from plotly.subplots import make_subplots
 
 
 EASTERN_TZ = "America/New_York"
+BULLISH_COLOR = "#1abc9c"
+BEARISH_COLOR = "#e74c3c"
+BULLISH_BAR_COLOR = "rgba(26, 188, 156, 0.45)"
+BEARISH_BAR_COLOR = "rgba(231, 76, 60, 0.45)"
 BENCHMARK_NAME = "Buy & Hold"
 BENCHMARK_LINE = dict(color="#111111", width=2.4)
 STRATEGY_LINE_COLORS = {
@@ -294,10 +298,12 @@ def _add_lower_indicator_window(
     display_df: pd.DataFrame,
     indicator_name: str,
     row: int,
+    bullish_bar_color: str = BULLISH_BAR_COLOR,
+    bearish_bar_color: str = BEARISH_BAR_COLOR,
 ) -> None:
     if indicator_name == "MACD":
         histogram_colors = [
-            "rgba(22, 163, 74, 0.45)" if value >= 0 else "rgba(220, 38, 38, 0.45)"
+            bullish_bar_color if value >= 0 else bearish_bar_color
             for value in display_df["macd_histogram"].fillna(0)
         ]
         fig.add_trace(
@@ -402,6 +408,31 @@ def _add_lower_indicator_window(
         fig.update_yaxes(title_text="Stoch", range=[0, 100], row=row, col=1)
 
 
+def selected_lower_indicator_windows(
+    display_df: pd.DataFrame,
+    selected_indicators: list[str],
+) -> list[str]:
+    return _selected_lower_windows(display_df, selected_indicators)
+
+
+def add_lower_indicator_window(
+    fig: go.Figure,
+    display_df: pd.DataFrame,
+    indicator_name: str,
+    row: int,
+    bullish_bar_color: str = BULLISH_BAR_COLOR,
+    bearish_bar_color: str = BEARISH_BAR_COLOR,
+) -> None:
+    _add_lower_indicator_window(
+        fig,
+        display_df,
+        indicator_name,
+        row,
+        bullish_bar_color=bullish_bar_color,
+        bearish_bar_color=bearish_bar_color,
+    )
+
+
 def plot_signal_chart(
     result: Any,
     selected_indicators: list[str],
@@ -440,10 +471,10 @@ def plot_signal_chart(
                 low=display_df["low"],
                 close=display_df["close"],
                 name="Price",
-                increasing_line_color="#16a34a",
-                increasing_fillcolor="#16a34a",
-                decreasing_line_color="#dc2626",
-                decreasing_fillcolor="#dc2626",
+                increasing_line_color=BULLISH_COLOR,
+                increasing_fillcolor=BULLISH_COLOR,
+                decreasing_line_color=BEARISH_COLOR,
+                decreasing_fillcolor=BEARISH_COLOR,
             ),
             row=1,
             col=1,
@@ -492,9 +523,7 @@ def plot_signal_chart(
     if _has_column(display_df, "volume"):
         if has_ohlc:
             volume_colors = [
-                "rgba(22, 163, 74, 0.45)"
-                if close >= open_
-                else "rgba(220, 38, 38, 0.45)"
+                BULLISH_BAR_COLOR if close >= open_ else BEARISH_BAR_COLOR
                 for open_, close in zip(display_df["open"], display_df["close"])
             ]
         else:

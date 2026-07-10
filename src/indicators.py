@@ -281,3 +281,21 @@ def add_all_indicators(
     price_col: str = "close",
 ) -> pd.DataFrame:
     return add_required_indicators(df, price_col=price_col)
+
+
+def add_selected_indicators(
+    df: pd.DataFrame,
+    selected_indicators: list[str],
+    price_col: str = "close",
+) -> pd.DataFrame:
+    """Add the indicator columns needed by the selected chart overlays/windows."""
+    result = add_required_indicators(df, price_col=price_col)
+
+    if "EMA 20" in selected_indicators and "ema_20" not in result.columns:
+        result = add_exponential_moving_average(
+            result,
+            span=20,
+            price_col=price_col,
+        )
+
+    return result

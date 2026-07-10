@@ -11,6 +11,131 @@ from src.config import get_settings
 from src.data_connector import get_historical_client, resolve_data_feed
 
 
+RANGE_PRESETS = {
+    "1D": pd.DateOffset(days=1),
+    "5D": pd.DateOffset(days=5),
+    "1M": pd.DateOffset(months=1),
+    "3M": pd.DateOffset(months=3),
+    "6M": pd.DateOffset(months=6),
+    "1Y": pd.DateOffset(years=1),
+    "5Y": pd.DateOffset(years=5),
+}
+
+
+def resolve_date_range(
+    selected_range: str,
+    custom_days: int | None = None,
+    end: pd.Timestamp | None = None,
+) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """Map a range selector value to an explicit calendar start/end range."""
+    resolved_end = (
+        pd.Timestamp(end)
+        if end is not None
+        else pd.Timestamp.now(tz="UTC").floor("min")
+    )
+
+    if resolved_end.tzinfo is None:
+        resolved_end = resolved_end.tz_localize("UTC")
+    else:
+        resolved_end = resolved_end.tz_convert("UTC")
+
+    if selected_range == "Custom":
+        offset = pd.DateOffset(days=int(custom_days or 30))
+    else:
+        offset = RANGE_PRESETS[selected_range]
+
+    return resolved_end - offset, resolved_end
+
+
+def resolve_tick_spec(
+    selected_tick: str,
+    custom_tick: int | None = None,
+) -> tuple[int, TimeFrameUnit, int]:
+    """Map a tick selector value to request timeframe and optional aggregate factor."""
+    if selected_tick == "Custom":
+        custom_tick_minutes = int(custom_tick or 1)
+
+        if custom_tick_minutes <= 59:
+            return custom_tick_minutes, TimeFrameUnit.Minute, 1
+
+        if custom_tick_minutes % 60 == 0:
+            return custom_tick_minutes // 60, TimeFrameUnit.Hour, 1
+
+        raise ValueError(
+            "Custom tick must be 1-59 minutes or a whole-hour minute value "
+            "(60, 120, 180, ...)."
+        )
+
+    if selected_tick.endswith("m"):
+        return int(selected_tick[:-1]), TimeFrameUnit.Minute, 1
+
+    if selected_tick in {"1D", "5D"}:
+        aggregate = 5 if selected_tick == "5D" else 1
+        return 1, TimeFrameUnit.Day, aggregate
+
+    if selected_tick in {"1M", "3M"}:
+        return int(selected_tick[:-1]), TimeFrameUnit.Month, 1
+
+    if selected_tick == "1h":
+        return 1, TimeFrameUnit.Hour, 1
+
+    return 1, TimeFrameUnit.Minute, 1
+
+
+def aggregate_bars_by_days(df: pd.DataFrame, days: int) -> pd.DataFrame:
+    """Aggregate daily bars into multi-day OHLCV bars."""
+    if days <= 1 or df.empty:
+        return df
+
+    resampled = (
+        df.set_index("timestamp")
+        .resample(f"{days}D", label="right")
+        .agg(
+            {
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+                "volume": "sum",
+            }
+        )
+    )
+
+    return resampled.dropna(subset=["open", "high", "low", "close"]).reset_index()
+
+
+def fetch_historical_chart_bars(
+    symbol: str,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    timeframe_value: int,
+    timeframe_unit: TimeFrameUnit,
+    aggregate_factor: int = 1,
+    client: StockHistoricalDataClient | None = None,
+) -> pd.DataFrame:
+    """Fetch bars for the terminal chart, applying multi-day aggregation if needed."""
+    request_value = timeframe_value
+    request_unit = timeframe_unit
+
+    if timeframe_unit == TimeFrameUnit.Day and aggregate_factor > 1:
+        request_value = 1
+
+    historical_client = client or get_historical_client()
+    bars = get_historical_bars(
+        client=historical_client,
+        symbol=symbol,
+        timeframe_value=request_value,
+        timeframe_unit=request_unit,
+        start=start.to_pydatetime(),
+        end=end.to_pydatetime(),
+    )
+
+    if timeframe_unit == TimeFrameUnit.Day and aggregate_factor > 1:
+        return aggregate_bars_by_days(bars, aggregate_factor)
+
+    return bars
+
+
 def get_historical_bars(
     client: StockHistoricalDataClient,
     symbol: str,
