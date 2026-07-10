@@ -7,12 +7,12 @@ learning signal generation, and Alpaca paper-trading execution.
 
 This project connects to Alpaca APIs to retrieve historical OHLCV data, display
 interactive price and volume charts, stream live bid/ask/last-trade updates,
-backtest long-only trading strategies, and demonstrate a machine-learning
-trading signal in Alpaca paper trading.
+backtest long-only trading strategies, and manage rule-based and ML strategies
+in Alpaca paper trading.
 
 The system features two Streamlit modes:
 
-- `trading.py`: market data terminal with historical charts, live quotes, an ML trading signal panel with automatic paper-order submission, and paper-trading logs.
+- `trading.py`: market data terminal with historical charts, live quotes, paper account monitoring, strategy management, and risk controls.
 - `backtesting.py`: strategy backtesting terminal for rule-based strategies and ML logistic-regression holdout backtesting, benchmarked to buy-and-hold.
 
 This is paper trading only - no real money is used.
@@ -56,10 +56,12 @@ conda env create -f environment.yml
 conda activate alpaca-terminal
 ```
 
-Create a local `.env` file from the example:
+Create local config files from the examples:
 
 ```bash
 cp .env.example .env
+cp risk_config.example.json risk_config.json
+cp strategy_config.example.json strategy_config.json
 ```
 
 Then add your Alpaca paper API key and secret to `.env`:
@@ -69,6 +71,9 @@ ALPACA_API_KEY=your_paper_api_key_here
 ALPACA_SECRET_KEY=your_paper_secret_key_here
 ALPACA_DATA_FEED=iex
 ```
+
+The local `.env`, `risk_config.json`, and `strategy_config.json` files are
+ignored by Git so credentials and personal settings are not committed.
 
 ## Run
 
@@ -96,37 +101,37 @@ streamlit run backtesting.py
 
 ```text
 alpaca-market-data-terminal/
-├── trading.py                  # Market data terminal and ML paper-trading panel
-├── backtesting.py              # Rule-based and ML backtesting terminal
+├── trading.py                  # Market data, paper account, strategies, risk
+├── backtesting.py              # Rule-based and ML backtesting
 ├── docs/
-│   ├── Week2_Report.pdf        # Homework 2 report
-│   ├── feature_model.md        # Features, PCA, and ML Model documentation
-│   └── strategy_indicators.md  # Strategy and indicator documentation
-├── logs/
-│   └── paper_trading.log       # Runtime paper-trading execution log
+│   ├── feature_model.md
+│   └── strategy_indicators.md
 ├── screenshots/                # Demo screenshots
 ├── src/
 │   ├── __init__.py
-│   ├── backtester.py           # Strategy simulation and buy-and-hold benchmark
-│   ├── company.py              # Ticker-to-company-name lookup
-│   ├── company_search.py       # Ticker/company search choices
-│   ├── config.py               # Alpaca credentials and data-feed settings
-│   ├── data_connector.py       # Historical, streaming, and paper-trading clients
-│   ├── execution.py            # Latest signal to Alpaca paper-order execution
-│   ├── features.py             # ML features, target, scaling, and PCA
-│   ├── historical.py           # Historical OHLCV bar retrieval
-│   ├── indicators.py           # Technical indicator columns
-│   ├── live_quotes.py          # Alpaca websocket quote/trade streaming
-│   ├── metrics.py              # Performance metric calculations
-│   ├── models.py               # Logistic regression training and ML signals
-│   ├── plots.py                # Plotly charts for signals, PCA, and performance
-│   └── strategies.py           # Rule-based long-only strategy signals
-├── .env.example                # Template for Alpaca paper credentials
-├── .gitignore                  # Excludes local secrets, caches, and system files
-├── environment.yml             # Conda environment specification
-├── requirements.txt            # Python package requirements
+│   ├── backtester.py
+│   ├── company.py
+│   ├── company_search.py
+│   ├── config.py
+│   ├── data_connector.py
+│   ├── execution.py
+│   ├── features.py
+│   ├── formatting.py
+│   ├── historical.py
+│   ├── indicators.py
+│   ├── live_quotes.py
+│   ├── metrics.py
+│   ├── models.py
+│   ├── plots.py
+│   ├── risk.py
+│   └── strategies.py
+├── .env.example
+├── risk_config.example.json
+├── strategy_config.example.json
+├── .gitignore
+├── environment.yml
+├── requirements.txt
 ├── LICENSE
-├── SKILL.md
 └── README.md
 ```
 
@@ -135,13 +140,13 @@ alpaca-market-data-terminal/
 During after-hours periods, live quote updates may be sparse in the market data
 terminal, but the panel should still show the last available quote.
 
-The ML model cache is Streamlit session-local. Restarting Streamlit clears the
-cached model, so the model should be trained again before refreshing the latest
-signal or submitting a paper order.
+Active and flat strategies are restored from the local `strategy_config.json`
+file. Risk settings are restored from the local `risk_config.json` file.
 
-The strategy and ML backtesters are intended for exploratory analysis. They are
-not production trading or portfolio accounting systems.
+The strategy and ML backtesters are exploratory tools. Paper trading is for
+testing only, not production portfolio accounting.
 
 ## Security Notes
 
-Do not commit `.env` or real API credentials. Commit `.env.example` only.
+Do not commit `.env`, `risk_config.json`, `strategy_config.json`, or real API
+credentials. Commit only the example config files.
