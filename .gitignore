@@ -7,3 +7,4 @@ __pycache__/
 SKILL.md
 logs/
 risk_config.json
+strategy_config.json
