@@ -101,9 +101,10 @@ alpaca-market-data-terminal/
 ├── trading.py                  # Market data, paper account, strategies, risk
 ├── backtesting.py              # Rule-based and ML backtesting
 ├── docs/
-│   ├── feature_model.md
-│   └── strategy_indicators.md
-├── screenshots/                # Demo screenshots
+│   ├── feature_model.md        # Documentation for feature engineering and ML model training
+│   ├── risk_controls.md        # Documentation for risk control mechanism
+│   └── strategy_indicators.md  # Documentation for technical indicators and rule-based straegies
+├── screenshots/                
 ├── src/
 │   ├── __init__.py
 │   ├── backtester.py
