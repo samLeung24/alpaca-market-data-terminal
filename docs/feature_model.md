@@ -223,6 +223,30 @@ chronological split:
 The default PCA variance threshold is `0.80`, so the pipeline keeps enough
 principal components to explain at least 80% of training-set feature variance.
 
+## ML Strategy Rationale
+
+The machine-learning strategy uses logistic regression to estimate whether the next daily return is more likely to be positive or non-positive. The model is still systematic and long-only: it does not make discretionary decisions, and it does not short the asset.
+
+The target variable is:
+
+- `1` if the next-period return is positive.
+- `0` if the next-period return is non-positive.
+
+The model uses features based on recent price, trend, momentum, volatility, and volume behavior. The rationale is that these variables may contain weak information about short-term direction. For example, recent momentum, volatility expansion, moving-average relationships, or volume pressure may slightly change the probability that the next return is positive.
+
+The strategy does not go long every time the model predicts class `1`. Instead, it uses a stricter probability threshold:
+
+- If `P(next-day return > 0) > 0.60`, the strategy goes Long.
+- If `P(next-day return > 0) <= 0.60`, the strategy stays Flat.
+
+The reason for using a 0.60 threshold is to make the strategy more selective. A 0.50 threshold would simply mean that the model thinks an up day is slightly more likely than a down day. By requiring 0.60, the system only enters when the model’s estimated probability is stronger.
+
+PCA is used because many technical indicators are correlated with each other. For example, moving averages, MACD, and rolling returns all contain related information about recent price behavior. PCA reduces dimensionality and helps control multicollinearity before logistic regression is trained.
+
+The pipeline also controls for look-ahead bias. The chronological split ensures that earlier observations are used for training and later observations are reserved for testing. The scaler and PCA are fit only on the training rows, then applied to the holdout rows. This prevents information from the test period from leaking into the model training process.
+
+The ML strategy should be interpreted carefully. Logistic regression is useful because it is simple, transparent, and less prone to overfitting than more complex models, but financial prediction is still difficult. The model may find weak relationships in historical data that do not remain stable in the future. Therefore, the holdout backtest and comparison against buy-and-hold are more important than training accuracy alone.
+
 ## Backtesting Mode
 
 The ML backtesting flow lives in `backtesting.py`.
